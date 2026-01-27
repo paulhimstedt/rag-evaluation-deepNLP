@@ -85,6 +85,14 @@ Use this to verify everything works before running the full evaluation.
 
 **Note:** The first run will take longer as it downloads the RAG model (~2GB). Subsequent runs will be faster since models are cached.
 
+### Option C: Limit Dataset Size (Faster Iteration)
+
+```bash
+modal run modal_rag_eval.py --max-samples 200
+```
+
+Use this to cap each dataset to a smaller number of samples for quick validation runs.
+
 ## Step 5: View Results
 
 Results are saved to the Modal volume and also available locally:

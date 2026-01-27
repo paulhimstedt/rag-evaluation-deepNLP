@@ -97,6 +97,11 @@ modal run modal_rag_eval.py --datasets-only
 modal run modal_rag_eval.py --test-mode
 ```
 
+**Limit samples per dataset** (faster iterations):
+```bash
+modal run modal_rag_eval.py --max-samples 200
+```
+
 ### Utility Functions
 
 **List available datasets**:

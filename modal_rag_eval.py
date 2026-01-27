@@ -45,6 +45,7 @@ image = (
         "tqdm>=4.60.0",
         "psutil>=5.8.0",
         "GitPython>=3.1.0",
+        "kaggle>=1.5.12",  # For automatic MS-MARCO download
         # Note: pytorch-lightning not needed for evaluation, only for training
     )
     # Add local Python files to the image
@@ -245,7 +246,7 @@ def setup_wiki_index():
     timeout=3600,
     cpu=4.0,
 )
-def prepare_datasets():
+def prepare_datasets(max_samples: int = 0):
     """
     Prepare all 7 evaluation datasets.
     Downloads from DPR and HuggingFace, converts to eval format.
@@ -253,6 +254,44 @@ def prepare_datasets():
     print("=" * 80)
     print("Preparing evaluation datasets")
     print("=" * 80)
+    
+    # Check if datasets are already uploaded
+    existing_datasets = []
+    if os.path.exists(EVAL_DATASETS_DIR):
+        source_files = [f for f in os.listdir(EVAL_DATASETS_DIR) if f.endswith('.source')]
+        if source_files:
+            existing_datasets = [f.replace('_test.source', '').replace('_dev.source', '') 
+                                for f in source_files]
+            print(f"\n✓ Found {len(source_files)} pre-uploaded dataset files:")
+            for f in sorted(source_files):
+                size = os.path.getsize(os.path.join(EVAL_DATASETS_DIR, f)) / 1024
+                print(f"  • {f} ({size:.1f} KB)")
+            print("\n⚠  Skipping dataset preparation - using pre-uploaded files")
+            print("   (This is the recommended workflow for reproducibility)")
+            print("\nTo re-download datasets, either:")
+            print("  1. Remove files: modal volume rm rag-data eval_datasets/*.source")
+            print("  2. Or prepare locally and re-upload (see docs/DATASET_PREPARATION_GUIDE.md)")
+            print()
+            
+            # Create a minimal results file
+            results = {f.replace('_test.source', '').replace('_dev.source', ''): 1 
+                      for f in source_files}
+            results_file = f"{RESULTS_DIR}/dataset_preparation_results.json"
+            os.makedirs(RESULTS_DIR, exist_ok=True)
+            with open(results_file, 'w') as f:
+                json.dump({
+                    "status": "pre-uploaded",
+                    "datasets": results,
+                    "note": "Datasets were uploaded via upload_datasets_to_modal.sh"
+                }, f, indent=2)
+            
+            volume.commit()
+            return
+    
+    # No pre-uploaded datasets found - proceed with preparation
+    print("\n📥 No pre-uploaded datasets found, attempting in-container preparation...")
+    print("   Note: Some datasets may fail due to environment constraints")
+    print("   Recommended: Use prepare_datasets_local.py + upload_datasets_to_modal.sh\n")
     
     # Set HF_TOKEN if available
     if 'HF_TOKEN' in os.environ:
@@ -262,11 +301,33 @@ def prepare_datasets():
     import sys
     sys.path.insert(0, CODE_DIR)
 
-    # Import and run dataset preparation
+    # Capture detailed logs to file
+    log_file = f"{RESULTS_DIR}/dataset_preparation.log"
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    
+    # Import and run dataset preparation with output capture
     from prepare_eval_datasets import DatasetPreparer
+    import io
+    import contextlib
 
-    preparer = DatasetPreparer(output_dir=EVAL_DATASETS_DIR)
-    results = preparer.prepare_all()
+    # Capture both stdout and stderr
+    log_capture = io.StringIO()
+    with contextlib.redirect_stdout(log_capture), contextlib.redirect_stderr(log_capture):
+        preparer = DatasetPreparer(output_dir=EVAL_DATASETS_DIR, max_samples=max_samples)
+        results = preparer.prepare_all()
+    
+    # Write logs to file
+    log_content = log_capture.getvalue()
+    with open(log_file, 'w') as f:
+        f.write(log_content)
+    
+    # Also print to console
+    print(log_content)
+    
+    # Save results summary
+    results_file = f"{RESULTS_DIR}/dataset_preparation_results.json"
+    with open(results_file, 'w') as f:
+        json.dump(results, f, indent=2)
 
     # Commit to volume
     volume.commit()
@@ -366,24 +427,41 @@ def run_evaluation(
     print(f"Running command: {' '.join(cmd)}")
 
     try:
-        # Run evaluation
-        result = subprocess.run(
+        # Run evaluation with streaming output
+        # This allows us to see progress as the model downloads and runs
+        process = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # Merge stderr into stdout
             text=True,
             cwd=CODE_DIR,
-            env=os.environ.copy()
+            env=os.environ.copy(),
+            bufsize=1,  # Line buffered
+            universal_newlines=True
         )
 
-        # Parse metrics from output
-        metrics = parse_metrics_from_output(result.stdout)
+        # Stream output in real-time and collect for parsing
+        stdout_lines = []
+        print("\n" + "=" * 80)
+        print("Evaluation Output:")
+        print("=" * 80)
+        for line in process.stdout:
+            print(line, end='')  # Print without extra newline
+            stdout_lines.append(line)
+        
+        # Wait for process to complete
+        return_code = process.wait()
+        stdout_text = ''.join(stdout_lines)
+        print("=" * 80 + "\n")
 
-        # Debug: Print last part of stdout/stderr if metrics are empty
+        # Parse metrics from output
+        metrics = parse_metrics_from_output(stdout_text)
+
+        # Debug: Print warning if metrics are empty
         if not metrics:
             print(f"\n⚠ Warning: No metrics found in output")
-            print(f"Last 500 chars of stdout:\n{result.stdout[-500:]}")
-            print(f"Last 500 chars of stderr:\n{result.stderr[-500:] if result.stderr else 'None'}")
-            print(f"Return code: {result.returncode}")
+            print(f"Last 500 chars of output:\n{stdout_text[-500:] if stdout_text else 'None'}")
+            print(f"Return code: {return_code}")
 
         # Count samples
         num_samples = 0
@@ -406,8 +484,8 @@ def run_evaluation(
             'num_samples': num_samples,
             'metrics': metrics,
             'status': 'success',
-            'stdout': result.stdout[-2000:],  # Last 2000 chars
-            'stderr': result.stderr[-1000:] if result.stderr else '',
+            'stdout': stdout_text[-2000:],  # Last 2000 chars
+            'return_code': return_code,
         }
 
     except Exception as e:
@@ -449,6 +527,7 @@ def main(
     setup_only: bool = False,
     datasets_only: bool = False,
     test_mode: bool = False,
+    max_samples: int = 0,
 ):
     """
     Main entrypoint for RAG evaluation on Modal.
@@ -462,6 +541,7 @@ def main(
                    - Testing changes without waiting for all 21 evaluations
                    - Estimating time/cost before committing to the full run
                    Expected time: ~2 hours, Cost: ~$3-5
+        max_samples: Max samples per dataset (0 means no limit)
     """
     print("\n" + "=" * 80)
     print("RAG Paper Reproduction - Modal Evaluation")
@@ -481,7 +561,7 @@ def main(
 
     # Step 2: Prepare evaluation datasets
     print("\n[2/4] Preparing evaluation datasets...")
-    dataset_results = prepare_datasets.remote()
+    dataset_results = prepare_datasets.remote(max_samples=max_samples)
     print(f"✓ Datasets prepared: {dataset_results}")
 
     if datasets_only:
@@ -579,10 +659,36 @@ def list_datasets():
         source = f"{EVAL_DATASETS_DIR}/{ds}_test.source"
         if os.path.exists(source):
             with open(source) as f:
-                count = sum(1 for _ in f)
-            print(f"  - {ds}: {count} samples")
+                num_samples = sum(1 for _ in f)
+            print(f"  {ds}: {num_samples} samples")
 
     return datasets
+
+
+@app.function(
+    image=image,
+    volumes={VOLUME_PATH: volume},
+)
+def get_dataset_logs():
+    """Retrieve dataset preparation logs from the volume."""
+    log_file = f"{RESULTS_DIR}/dataset_preparation.log"
+    results_file = f"{RESULTS_DIR}/dataset_preparation_results.json"
+    
+    logs = {}
+    
+    if os.path.exists(log_file):
+        with open(log_file, 'r') as f:
+            logs['full_log'] = f.read()
+    else:
+        logs['full_log'] = "Log file not found"
+    
+    if os.path.exists(results_file):
+        with open(results_file, 'r') as f:
+            logs['results'] = json.load(f)
+    else:
+        logs['results'] = {}
+    
+    return logs
 
 
 @app.function(
@@ -616,6 +722,9 @@ modal run modal_rag_eval.py --datasets-only
 
 # Test mode (single evaluation):
 modal run modal_rag_eval.py --test-mode
+
+# Limit dataset size for faster runs:
+modal run modal_rag_eval.py --max-samples 200
 
 # List available datasets:
 modal run modal_rag_eval.py::list_datasets

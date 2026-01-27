@@ -11,6 +11,34 @@ Such contextualized inputs are passed to the generator.
 
 Read more about RAG  at https://arxiv.org/abs/2005.11401.
 
+---
+
+# Quick Start (Evaluation)
+
+**Recommended workflow**: Prepare datasets locally, upload to Modal, run evaluation.
+
+```bash
+# 1. Prepare datasets locally (uses newer dependencies)
+python prepare_datasets_local.py
+
+# 2. Upload to Modal
+bash upload_datasets_to_modal.sh
+
+# 3. Run evaluation
+modal run modal_rag_eval.py --test-mode  # Test with 5 samples
+modal run modal_rag_eval.py              # Full evaluation
+```
+
+**Documentation**:
+- 📖 **[QUICK_REFERENCE.md](docs/QUICK_REFERENCE.md)** - Start here! 1-page guide for colleagues
+- 📚 **[DATASET_PREPARATION_GUIDE.md](docs/DATASET_PREPARATION_GUIDE.md)** - Complete instructions & troubleshooting
+- 📊 **[WORKFLOW_DIAGRAM.md](docs/WORKFLOW_DIAGRAM.md)** - Visual workflow diagrams
+- 🔧 **[IMPLEMENTATION_COMPLETE.md](docs/IMPLEMENTATION_COMPLETE.md)** - Technical implementation details
+- 💡 **[DATASET_STATUS.md](docs/DATASET_STATUS.md)** - Dataset status & known issues
+- 🎯 **[MSMARCO_SETUP.md](docs/MSMARCO_SETUP.md)** - MS-MARCO specific setup
+
+---
+
 # Note
 
 ⚠️ This project should be run with pytorch-lightning==1.3.1 which has a potential security vulnerability

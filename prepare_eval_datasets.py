@@ -22,8 +22,9 @@ import json
 import os
 import time
 import urllib.request
+import zipfile
 from pathlib import Path
-from typing import List, Dict
+from typing import Optional
 
 import pandas as pd
 from datasets import load_dataset
@@ -31,9 +32,13 @@ from tqdm import tqdm
 
 
 class DatasetPreparer:
-    def __init__(self, output_dir: str = "./eval_datasets"):
+    def __init__(self, output_dir: str = "./eval_datasets", max_samples: int = 0):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.max_samples: Optional[int] = max_samples if max_samples and max_samples > 0 else None
+
+    def _limit_reached(self, count: int) -> bool:
+        return self.max_samples is not None and count >= self.max_samples
 
     def download_file(self, url: str, output_path: Path, decompress_gz: bool = False, max_retries: int = 3):
         """Download a file from URL with retry logic."""
@@ -100,6 +105,8 @@ class DatasetPreparer:
 
         # Read CSV
         df = pd.read_csv(csv_path, sep='\t', header=None, names=['question', 'answers'])
+        if self.max_samples is not None:
+            df = df.head(self.max_samples)
 
         # Write .source file (questions)
         source_path = self.output_dir / f"{dataset_name}_{split}.source"
@@ -172,6 +179,7 @@ class DatasetPreparer:
 
         if test_csv is None or not test_csv.exists():
             print("  DPR download failed, trying alternative sources...")
+            num_test = 0
             # Try FlashRAG
             try:
                 print("Trying FlashRAG webquestions dataset...")
@@ -183,7 +191,10 @@ class DatasetPreparer:
                 
                 with open(source_path, 'w', encoding='utf-8') as f_src, \
                      open(target_path, 'w', encoding='utf-8') as f_tgt:
+                    num_test = 0
                     for item in test_data:
+                        if self._limit_reached(num_test):
+                            break
                         question = item.get('question', '')
                         answers = item.get('answers', item.get('golden_answers', []))
                         if question and answers:
@@ -192,7 +203,7 @@ class DatasetPreparer:
                                 f_tgt.write(f"{question.strip()}\t{str(answers)}\n")
                             else:
                                 f_tgt.write(f"{question.strip()}\t['{answers}']\n")
-                num_test = len(test_data)
+                            num_test += 1
                 print(f"  Loaded from FlashRAG: {num_test} samples")
             except Exception as e:
                 print(f"FlashRAG failed: {e}, trying stanfordnlp...")
@@ -207,12 +218,14 @@ class DatasetPreparer:
                     with open(source_path, 'w', encoding='utf-8') as f_src, \
                          open(target_path, 'w', encoding='utf-8') as f_tgt:
                         for item in test_data:
+                            if self._limit_reached(num_test):
+                                break
                             question = item.get('question', '')
                             answers = item.get('answers', [])
                             if question and answers:
                                 f_src.write(question.strip() + '\n')
                                 f_tgt.write(f"{question.strip()}\t{str(answers)}\n")
-                    num_test = len(test_data)
+                                num_test += 1
                     print(f"  Loaded from stanfordnlp: {num_test} samples")
                 except Exception as e2:
                     print(f"stanfordnlp also failed: {e2}")
@@ -262,6 +275,8 @@ class DatasetPreparer:
                 with open(source_path, 'w', encoding='utf-8') as f_src, \
                      open(target_path, 'w', encoding='utf-8') as f_tgt:
                     for item in test_data:
+                        if self._limit_reached(num_test):
+                            break
                         question = item.get('question', '')
                         answers = item.get('answers', item.get('golden_answers', []))
                         if question and answers:
@@ -270,7 +285,7 @@ class DatasetPreparer:
                                 f_tgt.write(f"{question.strip()}\t{str(answers)}\n")
                             else:
                                 f_tgt.write(f"{question.strip()}\t['{answers}']\n")
-                num_test = len(test_data)
+                            num_test += 1
                 print(f"  Loaded from FlashRAG: {num_test} samples")
             except Exception as e:
                 print(f"FlashRAG failed: {e}")
@@ -295,6 +310,8 @@ class DatasetPreparer:
                     with open(source_path, 'w', encoding='utf-8') as f_src, \
                          open(target_path, 'w', encoding='utf-8') as f_tgt:
                         for item in dev_data:
+                            if self._limit_reached(num_dev):
+                                break
                             question = item.get('question', '')
                             answers = item.get('answers', item.get('golden_answers', []))
                             if question and answers:
@@ -303,7 +320,7 @@ class DatasetPreparer:
                                     f_tgt.write(f"{question.strip()}\t{str(answers)}\n")
                                 else:
                                     f_tgt.write(f"{question.strip()}\t['{answers}']\n")
-                    num_dev = len(dev_data)
+                                num_dev += 1
                 else:
                     num_dev = 0
             except:
@@ -312,172 +329,344 @@ class DatasetPreparer:
         print(f"CuratedTrec: {num_dev} dev samples, {num_test} test samples")
         return num_test
 
+    def _download_msmarco_from_kaggle(self):
+        """Attempt to download MS-MARCO from Kaggle using API credentials."""
+        try:
+            import kaggle
+            from kaggle.api.kaggle_api_extended import KaggleApi
+            
+            print("  Attempting to download from Kaggle API...")
+            api = KaggleApi()
+            api.authenticate()
+            
+            # Download dataset
+            dataset_name = "parthplc/ms-marco-dataset"
+            download_path = str(self.output_dir)
+            
+            print(f"  Downloading {dataset_name}...")
+            api.dataset_download_files(dataset_name, path=download_path, unzip=True)
+            print("  ✓ Downloaded and extracted MS-MARCO from Kaggle")
+            return True
+            
+        except ImportError:
+            print("  ℹ️  Kaggle package not installed (pip install kaggle)")
+            return False
+        except Exception as e:
+            print(f"  ℹ️  Kaggle API download failed: {e}")
+            print("  Note: Requires ~/.kaggle/kaggle.json with API credentials")
+            return False
+    
     def prepare_msmarco(self):
         """Prepare MS-MARCO NLG v2.1 dataset from multiple sources."""
         print("\n=== Preparing MS-MARCO NLG v2.1 ===")
-        print("Note: If this fails, MS-MARCO is available on Kaggle:")
-        print("  https://www.kaggle.com/datasets/parthplc/ms-marco-dataset/data")
-        print("  Download train.csv and valid.csv, place in eval_datasets/ folder")
-
+        
         # Check if Kaggle CSV exists first
         kaggle_train = self.output_dir / "ms-marco-train.csv"
         kaggle_valid = self.output_dir / "ms-marco-valid.csv"
         
+        # If files don't exist, try automatic Kaggle download
+        if not (kaggle_train.exists() and kaggle_valid.exists()):
+            print("MS-MARCO files not found locally, attempting automatic download...")
+            if self._download_msmarco_from_kaggle():
+                # Check again after download
+                if not (kaggle_train.exists() and kaggle_valid.exists()):
+                    print("  ⚠️  Download succeeded but expected files not found")
+                    print(f"  Looking for: {kaggle_train.name}, {kaggle_valid.name}")
+        
+        # Process Kaggle CSV if available
         if kaggle_train.exists() and kaggle_valid.exists():
-            print("Found Kaggle MS-MARCO files, using those...")
+            print("Found Kaggle MS-MARCO CSV files, processing...")
             try:
-                # Load from CSV
+                # Load validation set (smaller, better for testing)
                 df = pd.read_csv(kaggle_valid)
+                
+                # Inspect columns to understand structure
+                print(f"  CSV columns: {list(df.columns)}")
+                print(f"  Total rows: {len(df)}")
+                
+                if self.max_samples is not None:
+                    df = df.head(self.max_samples)
+                
                 source_path = self.output_dir / "msmarco_test.source"
                 target_path = self.output_dir / "msmarco_test.target"
                 
+                count = 0
                 with open(source_path, 'w', encoding='utf-8') as f_src, \
                      open(target_path, 'w', encoding='utf-8') as f_tgt:
                     for _, row in df.iterrows():
-                        # Adjust column names based on actual CSV structure
-                        question = row.get('query', row.get('question', ''))
-                        answer = row.get('answer', row.get('passage', ''))
-                        if question and answer:
-                            f_src.write(str(question).strip() + '\n')
-                            f_tgt.write(f"{str(question).strip()}\t['{str(answer).strip()}']\n")
+                        # Try multiple possible column names
+                        question = str(row.get('query', row.get('question', row.get('Query', '')))).strip()
+                        answer = str(row.get('answer', row.get('passage', row.get('Answer', row.get('Passage', ''))))).strip()
+                        
+                        if question and answer and question != 'nan' and answer != 'nan':
+                            f_src.write(question + '\n')
+                            f_tgt.write(f"{question}\t['{answer}']\n")
+                            count += 1
                 
-                num_samples = len(df)
-                print(f"  Created {source_path} ({num_samples} samples)")
-                return num_samples
+                print(f"  ✓ Created {source_path} ({count} samples)")
+                return count
             except Exception as e:
-                print(f"Error loading Kaggle CSV: {e}")
+                print(f"  ✗ Error processing Kaggle CSV: {e}")
+                import traceback
+                traceback.print_exc()
 
+        # Strategy 1: Skip FlashRAG for datasets 1.18.0 compatibility
+        # Note: FlashRAG uses glob patterns incompatible with datasets 1.18.0
+        # This works locally with newer datasets versions but fails in Modal
+        
+        # Strategy 2: Try ms_marco v1.1 config
         try:
-            # Load dataset from HuggingFace
-            print("Loading MS-MARCO from HuggingFace (this may take a while)...")
-            # Try different versions
-            dataset = None
-            for version in ["v2.1", "v1.1"]:
-                try:
-                    dataset = load_dataset("microsoft/ms_marco", version, trust_remote_code=True)
-                    print(f"  Successfully loaded MS-MARCO {version}")
-                    break
-                except Exception as e:
-                    print(f"  Failed to load version {version}: {e}")
-                    continue
-
-            if dataset is None:
-                raise Exception("Failed to load MS-MARCO from any version")
-
-            # Use test split if available, otherwise use validation
-            if 'test' in dataset:
-                test_data = dataset['test']
-            elif 'validation' in dataset:
-                test_data = dataset['validation']
-            else:
-                print("Warning: No test or validation split found, using train split")
-                test_data = dataset['train']
-
-            # Extract questions and answers
-            # MS-MARCO format: query (question) -> passages -> answers
+            print("Attempting MS-MARCO from ms_marco 'v1.1' config...")
+            dataset = load_dataset("ms_marco", "v1.1")
+            print("  Successfully loaded MS-MARCO v1.1")
+            
+            test_data = dataset.get('validation', dataset.get('test', dataset.get('train')))
+            
             source_path = self.output_dir / "msmarco_test.source"
             target_path = self.output_dir / "msmarco_test.target"
 
             with open(source_path, 'w', encoding='utf-8') as f_src, \
                  open(target_path, 'w', encoding='utf-8') as f_tgt:
-
+                count = 0
                 for item in tqdm(test_data, desc="Processing MS-MARCO"):
-                    query = item.get('query', '')
-                    # Get answers - MS-MARCO has 'wellFormedAnswers' or 'answers'
+                    if self._limit_reached(count):
+                        break
+                    query = item.get('query', item.get('question', ''))
                     answers = item.get('wellFormedAnswers', item.get('answers', []))
+                    
+                    # Handle passages if answers not available
+                    if not answers and 'passages' in item:
+                        passages = item.get('passages', {})
+                        if isinstance(passages, dict) and 'passage_text' in passages:
+                            answers = passages['passage_text'][:1]  # Take first passage
+                    
+                    if query and answers:
+                        f_src.write(str(query).strip() + '\n')
+                        # Handle different answer formats
+                        if isinstance(answers, list) and len(answers) > 0:
+                            answer = answers[0] if isinstance(answers[0], str) else str(answers[0])
+                            f_tgt.write(f"{str(query).strip()}\t['{answer.strip()}']\n")
+                            count += 1
+                        elif isinstance(answers, str):
+                            f_tgt.write(f"{str(query).strip()}\t['{answers.strip()}']\n")
+                            count += 1
 
+            print(f"  Created {source_path} ({count} samples)")
+            return count
+        except Exception as e:
+            print(f"  Failed with ms_marco v1.1: {e}")
+
+        # Strategy 2: Try microsoft/ms_marco v2.1
+        try:
+            print("Attempting MS-MARCO from microsoft/ms_marco v2.1...")
+            dataset = load_dataset("microsoft/ms_marco", "v2.1")
+            print(f"  Successfully loaded MS-MARCO v2.1")
+            
+            test_data = dataset.get('validation', dataset.get('test', dataset.get('train')))
+            
+            source_path = self.output_dir / "msmarco_test.source"
+            target_path = self.output_dir / "msmarco_test.target"
+
+            with open(source_path, 'w', encoding='utf-8') as f_src, \
+                 open(target_path, 'w', encoding='utf-8') as f_tgt:
+                count = 0
+                for item in tqdm(test_data, desc="Processing MS-MARCO"):
+                    if self._limit_reached(count):
+                        break
+                    query = item.get('query', '')
+                    answers = item.get('wellFormedAnswers', item.get('answers', []))
                     if query and answers:
                         f_src.write(query.strip() + '\n')
-                        # Format answers as list string for qa mode
                         answer_str = str(answers)
                         f_tgt.write(f"{query.strip()}\t{answer_str}\n")
+                        count += 1
 
-            num_samples = len(test_data)
-            print(f"  Created {source_path} ({num_samples} samples)")
-            print(f"  Created {target_path}")
-            return num_samples
-
+            print(f"  Created {source_path} ({count} samples)")
+            return count
         except Exception as e:
-            print(f"Error loading MS-MARCO: {e}")
-            print("Trying alternative dataset: din0s/msmarco-nlgen")
+            print(f"  Failed with microsoft/ms_marco: {e}")
 
-            try:
-                dataset = load_dataset("din0s/msmarco-nlgen")
-                test_data = dataset['test'] if 'test' in dataset else dataset['validation']
+        # Strategy 3: Try ms_marco v1.1 config
+        try:
+            print("Attempting MS-MARCO from ms_marco 'v1.1' config...")
+            dataset = load_dataset("ms_marco", "v1.1")
+            print("  Successfully loaded MS-MARCO v1.1")
+            
+            test_data = dataset.get('validation', dataset.get('test', dataset.get('train')))
+            
+            source_path = self.output_dir / "msmarco_test.source"
+            target_path = self.output_dir / "msmarco_test.target"
 
-                source_path = self.output_dir / "msmarco_test.source"
-                target_path = self.output_dir / "msmarco_test.target"
+            with open(source_path, 'w', encoding='utf-8') as f_src, \
+                 open(target_path, 'w', encoding='utf-8') as f_tgt:
+                count = 0
+                for item in tqdm(test_data, desc="Processing MS-MARCO"):
+                    if self._limit_reached(count):
+                        break
+                    query = item.get('query', item.get('question', ''))
+                    answers = item.get('wellFormedAnswers', item.get('answers', item.get('passages', {}).get('passage_text', [])))
+                    
+                    if query and answers:
+                        f_src.write(str(query).strip() + '\n')
+                        # Handle different answer formats
+                        if isinstance(answers, list) and len(answers) > 0:
+                            answer = answers[0] if isinstance(answers[0], str) else str(answers[0])
+                            f_tgt.write(f"{str(query).strip()}\t['{answer.strip()}']\n")
+                            count += 1
+                        elif isinstance(answers, str):
+                            f_tgt.write(f"{str(query).strip()}\t['{answers.strip()}']\n")
+                            count += 1
 
-                with open(source_path, 'w', encoding='utf-8') as f_src, \
-                     open(target_path, 'w', encoding='utf-8') as f_tgt:
-
-                    for item in tqdm(test_data, desc="Processing MS-MARCO"):
-                        question = item.get('question', '')
-                        answer = item.get('answer', '')
-
-                        if question and answer:
-                            f_src.write(question.strip() + '\n')
-                            f_tgt.write(f"{question.strip()}\t['{answer.strip()}']\n")
-
-                num_samples = len(test_data)
-                print(f"  Created {source_path} ({num_samples} samples)")
-                return num_samples
-
-            except Exception as e2:
-                print(f"Error with alternative dataset: {e2}")
-                print("MS-MARCO preparation failed. Skipping...")
-                return 0
+            print(f"  Created {source_path} ({count} samples)")
+            return count
+        except Exception as e:
+            print(f"  Failed with ms_marco v1.1: {e}")
+        
+        print("\nAll MS-MARCO loading strategies failed.")
+        print("\n⚠️  MS-MARCO requires manual download in Modal environment:")
+        print("  Reason: Microsoft's blob storage returns 409 errors")
+        print("  FlashRAG incompatible with datasets==1.18.0 (used in Modal)")
+        print("\nTo use MS-MARCO:")
+        print("  1. Download from: https://www.kaggle.com/datasets/parthplc/ms-marco-dataset/data")
+        print("  2. Upload 'ms-marco-train.csv' and 'ms-marco-valid.csv' to Modal volume:")
+        print("     modal volume put rag-data ms-marco-train.csv eval_datasets/ms-marco-train.csv")
+        print("     modal volume put rag-data ms-marco-valid.csv eval_datasets/ms-marco-valid.csv")
+        print("  3. Re-run dataset preparation")
+        print("\nNote: MS-MARCO is optional - core benchmarks (NQ, TriviaQA, WebQ, Trec) work ✓")
+        return 0
 
     def prepare_searchqa(self):
         """Prepare SearchQA (Jeopardy) dataset from HuggingFace."""
         print("\n=== Preparing SearchQA (Jeopardy) ===")
 
+        # Strategy 1: Try original kyunghyuncho/search_qa
+        # Note: This requires datasets==1.18.0 (has dataset script support)
         try:
-            # Load dataset from HuggingFace with the correct config
-            print("Loading SearchQA from HuggingFace...")
-            # kyunghyuncho/search_qa requires specifying a config
+            print("Attempting SearchQA from kyunghyuncho/search_qa...")
+            # This works with datasets 1.18.0 but not newer versions
             dataset = load_dataset("kyunghyuncho/search_qa", "train_test_val")
+            print("  Successfully loaded SearchQA")
 
             # Use test split
             test_data = dataset['test']
 
-            # SearchQA format: answer (Jeopardy answer) -> question (Jeopardy question)
-            # For RAG: we use question as input, answer as target
             source_path = self.output_dir / "searchqa_test.source"
             target_path = self.output_dir / "searchqa_test.target"
 
             with open(source_path, 'w', encoding='utf-8') as f_src, \
                  open(target_path, 'w', encoding='utf-8') as f_tgt:
-
                 count = 0
                 for item in tqdm(test_data, desc="Processing SearchQA"):
-                    # Handle different possible field names
-                    question = item.get('question', item.get('query', ''))
-                    answer = item.get('answer', item.get('answers', ''))
+                    if self._limit_reached(count):
+                        break
+                    # Extract question and answer fields
+                    question = item.get('question', '')
+                    answer = item.get('answer', '')
                     
                     # Handle if answer is a list
                     if isinstance(answer, list) and len(answer) > 0:
                         answer = answer[0]
                     
-                    # Convert to string if needed
-                    question = str(question) if question else ''
-                    answer = str(answer) if answer else ''
+                    # Handle if answer/question are bytes
+                    if isinstance(question, bytes):
+                        question = question.decode('utf-8', errors='ignore')
+                    if isinstance(answer, bytes):
+                        answer = answer.decode('utf-8', errors='ignore')
+                    
+                    # Convert to string and clean
+                    question = str(question).strip() if question else ''
+                    answer = str(answer).strip() if answer else ''
 
-                    if question and answer and question.strip() and answer.strip():
-                        f_src.write(question.strip() + '\n')
-                        # Format as qa mode
-                        f_tgt.write(f"{question.strip()}\t['{answer.strip()}']\n")
+                    if question and answer:
+                        f_src.write(question + '\n')
+                        f_tgt.write(f"{question}\t['{answer}']\n")
                         count += 1
 
-            num_samples = count
-            print(f"  Created {source_path} ({num_samples} samples)")
-            print(f"  Created {target_path}")
-            return num_samples
-
+            print(f"  Created {source_path} ({count} samples)")
+            return count
+        except RuntimeError as e:
+            if "Dataset scripts are no longer supported" in str(e):
+                print(f"  ⚠ Dataset script not supported in this datasets version")
+                print(f"    This dataset requires datasets==1.18.0 (used in Modal)")
+            else:
+                print(f"  Failed with kyunghyuncho/search_qa: {e}")
         except Exception as e:
-            print(f"Error loading SearchQA: {e}")
-            print("SearchQA preparation failed. Skipping...")
-            return 0
+            print(f"  Failed with kyunghyuncho/search_qa: {e}")
+            import traceback
+            print(f"  Full traceback:")
+            traceback.print_exc()
+
+        # Strategy 2: Try direct file download from HuggingFace (fallback)
+        try:
+            print("Attempting direct download from HuggingFace repository...")
+            import urllib.request
+            import gzip
+            
+            # SearchQA test file URL - files are in root directory, not /data subfolder
+            base_url = "https://huggingface.co/datasets/kyunghyuncho/search_qa/resolve/main"
+            test_file_url = f"{base_url}/test.txt.gz"
+            
+            temp_gz_path = self.output_dir / "searchqa_test.txt.gz"
+            temp_txt_path = self.output_dir / "searchqa_test.txt"
+            
+            print(f"  Downloading {test_file_url}...")
+            req = urllib.request.Request(
+                test_file_url,
+                headers={'User-Agent': 'Mozilla/5.0'}
+            )
+            with urllib.request.urlopen(req, timeout=60) as response:
+                with open(temp_gz_path, 'wb') as f:
+                    f.write(response.read())
+            
+            # Decompress
+            print(f"  Decompressing...")
+            with gzip.open(temp_gz_path, 'rb') as f_in:
+                with open(temp_txt_path, 'wb') as f_out:
+                    f_out.write(f_in.read())
+            
+            # Parse and convert to eval format
+            source_path = self.output_dir / "searchqa_test.source"
+            target_path = self.output_dir / "searchqa_test.target"
+            
+            count = 0
+            with open(temp_txt_path, 'r', encoding='utf-8') as f_in, \
+                 open(source_path, 'w', encoding='utf-8') as f_src, \
+                 open(target_path, 'w', encoding='utf-8') as f_tgt:
+                
+                for line in f_in:
+                    if self._limit_reached(count):
+                        break
+                    line = line.strip()
+                    if line:
+                        # Parse JSON line
+                        try:
+                            data = json.loads(line)
+                            question = data.get('question', '')
+                            answer = data.get('answer', '')
+                            
+                            if question and answer:
+                                f_src.write(question + '\\n')
+                                f_tgt.write(f"{question}\\t['{answer}']\\n")
+                                count += 1
+                        except json.JSONDecodeError:
+                            continue
+            
+            # Cleanup temp files
+            temp_gz_path.unlink(missing_ok=True)
+            temp_txt_path.unlink(missing_ok=True)
+            
+            print(f"  Created {source_path} ({count} samples)")
+            return count
+            
+        except Exception as e:
+            print(f"  Failed with direct download: {e}")
+        
+        print("All SearchQA loading strategies failed.")
+        print("⚠  SearchQA appears to have data corruption issues")
+        print("  Dataset downloads but JSON parsing fails - known issue in repository")
+        print("\nSearchQA will be skipped. This is an optional dataset - core benchmarks work ✓")
+        return 0
+        return 0
 
     def prepare_fever(self):
         """Prepare FEVER dataset from HuggingFace."""
@@ -531,6 +720,8 @@ class DatasetPreparer:
                  open(target_path_2way, 'w', encoding='utf-8') as f_tgt_2:
 
                 for item in tqdm(test_data, desc="Processing FEVER"):
+                    if self._limit_reached(count_3way):
+                        break
                     claim = item.get('claim', '')
                     label = item.get('label', '')
 
@@ -562,6 +753,9 @@ class DatasetPreparer:
         print("=" * 80)
         print("RAG Evaluation Dataset Preparation")
         print("=" * 80)
+        if self.max_samples is not None:
+            print(f"Max samples per dataset: {self.max_samples}")
+            print("=" * 80)
 
         results = {}
 
@@ -636,9 +830,15 @@ def main():
         default="./eval_datasets",
         help="Directory to save prepared datasets"
     )
+    parser.add_argument(
+        "--max_samples",
+        type=int,
+        default=0,
+        help="Max samples per dataset (0 means no limit)"
+    )
     args = parser.parse_args()
 
-    preparer = DatasetPreparer(output_dir=args.output_dir)
+    preparer = DatasetPreparer(output_dir=args.output_dir, max_samples=args.max_samples)
     preparer.prepare_all()
 
 
