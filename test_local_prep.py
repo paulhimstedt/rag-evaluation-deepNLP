@@ -59,7 +59,6 @@ def test_single_dataset(preparer, dataset_name):
 
 
 def verify_dataset_files(output_dir, dataset_name, split='test'):
-    """Verify that dataset files were created correctly."""
     source_path = Path(output_dir) / f"{dataset_name}_{split}.source"
     target_path = Path(output_dir) / f"{dataset_name}_{split}.target"
 
@@ -71,10 +70,10 @@ def verify_dataset_files(output_dir, dataset_name, split='test'):
         print(f"  ✗ Missing target file: {target_path}")
         return False
 
-    # Count lines
-    with open(source_path) as f:
+    # Count lines (FIX: specify encoding)
+    with open(source_path, encoding="utf-8") as f:
         source_lines = sum(1 for _ in f)
-    with open(target_path) as f:
+    with open(target_path, encoding="utf-8") as f:
         target_lines = sum(1 for _ in f)
 
     print(f"  ✓ Source file: {source_path} ({source_lines} lines)")
@@ -85,15 +84,16 @@ def verify_dataset_files(output_dir, dataset_name, split='test'):
 
     # Show sample
     print(f"\n  Sample from {dataset_name}:")
-    with open(source_path) as f:
+    with open(source_path, encoding="utf-8") as f:
         sample_source = f.readline().strip()
-    with open(target_path) as f:
+    with open(target_path, encoding="utf-8") as f:
         sample_target = f.readline().strip()
 
     print(f"    Q: {sample_source[:100]}...")
     print(f"    A: {sample_target[:100]}...")
 
     return True
+
 
 
 def main():
