@@ -1,0 +1,16 @@
+# Modal-specific requirements for RAG evaluation
+# Strict version pinning for maximum compatibility with Python 3.10+
+
+# Core dependencies - ORDER MATTERS for proper resolution
+numpy>=1.19.0,<2.0.0     # Pin to 1.x for pyarrow/datasets compatibility (numpy 2.x breaks old packages)
+pyarrow>=6.0.0,<15.0.0   # Compatible with datasets 1.18.0 (needs PyExtensionType, removed in 21.0.0)
+datasets==1.18.0          # Pin as requested
+transformers==4.30.2      # Specific version tested to work with this stack
+torch==2.0.1              # Pin for stability and compatibility
+faiss-cpu==1.7.4          # Pin for reproducibility
+pandas>=1.3.0,<2.0.0      # 1.x series for compatibility
+tqdm>=4.60.0
+psutil>=5.8.0
+GitPython>=3.1.0
+
+# Note: pytorch-lightning not needed for evaluation (only for training)
