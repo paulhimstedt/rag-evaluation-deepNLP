@@ -359,7 +359,112 @@ class DatasetPreparer:
     def prepare_msmarco(self):
         """Prepare MS-MARCO NLG v2.1 dataset from multiple sources."""
         print("\n=== Preparing MS-MARCO NLG v2.1 ===")
-        
+
+        def ensure_min_size(path: Path, min_bytes: int, label: str):
+            if path.exists() and path.stat().st_size < min_bytes:
+                size_mb = path.stat().st_size / (1024 * 1024)
+                print(f"  ⚠ {label} file too small ({size_mb:.1f} MB), re-downloading...")
+                path.unlink(missing_ok=True)
+
+        def extract_query_and_answer(item):
+            query = item.get('query', item.get('question', item.get('query_text', '')))
+            answers = item.get('wellFormedAnswers')
+            if answers is None:
+                answers = item.get('answers', [])
+
+            passages = item.get('passages')
+            if not answers and passages is not None:
+                if isinstance(passages, dict):
+                    is_selected = passages.get('is_selected', [])
+                    passage_texts = passages.get('passage_text', [])
+                    if is_selected and passage_texts:
+                        for sel, text in zip(is_selected, passage_texts):
+                            if sel and text:
+                                answers = [text]
+                                break
+                    if not answers and passage_texts:
+                        answers = [passage_texts[0]]
+                elif isinstance(passages, list):
+                    answers = passages
+
+            answer = ""
+            if isinstance(answers, list):
+                for a in answers:
+                    if isinstance(a, dict):
+                        for key in ('passage_text', 'text', 'answer', 'passage'):
+                            if a.get(key):
+                                answer = str(a.get(key))
+                                break
+                    elif a:
+                        answer = str(a)
+                    if answer:
+                        break
+            elif isinstance(answers, dict):
+                for key in ('passage_text', 'text', 'answer', 'passage'):
+                    val = answers.get(key)
+                    if isinstance(val, list):
+                        for v in val:
+                            if v:
+                                answer = str(v)
+                                break
+                    elif val:
+                        answer = str(val)
+                    if answer:
+                        break
+            elif answers:
+                answer = str(answers)
+
+            query = str(query).strip() if query else ''
+            answer = str(answer).strip() if answer else ''
+            return query, answer
+
+        def write_msmarco_parquet(parquet_path):
+            try:
+                import pyarrow.parquet as pq
+            except ImportError as e:
+                raise RuntimeError("pyarrow is required to read parquet files. Install with: pip install pyarrow") from e
+
+            pf = pq.ParquetFile(parquet_path)
+
+            source_path = self.output_dir / "msmarco_test.source"
+            target_path = self.output_dir / "msmarco_test.target"
+
+            count = 0
+            with open(source_path, 'w', encoding='utf-8') as f_src, \
+                 open(target_path, 'w', encoding='utf-8') as f_tgt:
+                for rg in range(pf.num_row_groups):
+                    table = pf.read_row_group(rg, columns=["query", "answers", "wellFormedAnswers", "passages"])
+                    rows = table.to_pylist()
+                    for item in rows:
+                        if self._limit_reached(count):
+                            return count
+                        query, answer = extract_query_and_answer(item)
+                        if query and answer and query != 'nan' and answer != 'nan':
+                            f_src.write(query + '\n')
+                            f_tgt.write(f"{query}\t['{answer}']\n")
+                            count += 1
+
+            return count
+
+        def write_msmarco_split(test_data):
+            source_path = self.output_dir / "msmarco_test.source"
+            target_path = self.output_dir / "msmarco_test.target"
+
+            count = 0
+            with open(source_path, 'w', encoding='utf-8') as f_src, \
+                 open(target_path, 'w', encoding='utf-8') as f_tgt:
+                for item in tqdm(test_data, desc="Processing MS-MARCO"):
+                    if self._limit_reached(count):
+                        break
+                    query, answer = extract_query_and_answer(item)
+                    if query and answer and query != 'nan' and answer != 'nan':
+                        f_src.write(query + '\n')
+                        f_tgt.write(f"{query}\t['{answer}']\n")
+                        count += 1
+
+            print(f"  Created {source_path} ({count} samples)")
+            return count
+
         # Check if Kaggle CSV exists first
         kaggle_train = self.output_dir / "ms-marco-train.csv"
         kaggle_valid = self.output_dir / "ms-marco-valid.csv"
@@ -387,22 +492,21 @@ class DatasetPreparer:
                 if self.max_samples is not None:
                     df = df.head(self.max_samples)
                 
+                count = 0
                 source_path = self.output_dir / "msmarco_test.source"
                 target_path = self.output_dir / "msmarco_test.target"
-                
-                count = 0
+
                 with open(source_path, 'w', encoding='utf-8') as f_src, \
                      open(target_path, 'w', encoding='utf-8') as f_tgt:
                     for _, row in df.iterrows():
-                        # Try multiple possible column names
                         question = str(row.get('query', row.get('question', row.get('Query', '')))).strip()
                         answer = str(row.get('answer', row.get('passage', row.get('Answer', row.get('Passage', ''))))).strip()
-                        
+
                         if question and answer and question != 'nan' and answer != 'nan':
                             f_src.write(question + '\n')
                             f_tgt.write(f"{question}\t['{answer}']\n")
                             count += 1
-                
+
                 print(f"  ✓ Created {source_path} ({count} samples)")
                 return count
             except Exception as e:
@@ -410,79 +514,40 @@ class DatasetPreparer:
                 import traceback
                 traceback.print_exc()
 
-        # Strategy 1: Skip FlashRAG for datasets 1.18.0 compatibility
-        # Note: FlashRAG uses glob patterns incompatible with datasets 1.18.0
-        # This works locally with newer datasets versions but fails in Modal
-        
-        # Strategy 2: Try ms_marco v1.1 config
+        # Strategy 1: Load MS-MARCO v2.1 directly from HuggingFace parquet files
         try:
-            print("Attempting MS-MARCO from ms_marco 'v1.1' config...")
-            dataset = load_dataset("ms_marco", "v1.1")
-            print("  Successfully loaded MS-MARCO v1.1")
-            
-            test_data = dataset.get('validation', dataset.get('test', dataset.get('train')))
-            
-            source_path = self.output_dir / "msmarco_test.source"
-            target_path = self.output_dir / "msmarco_test.target"
+            print("Attempting MS-MARCO v2.1 from HuggingFace parquet files...")
+            base_url = "https://huggingface.co/datasets/microsoft/ms_marco/resolve/main/v2.1"
+            validation_url = f"{base_url}/validation-00000-of-00001.parquet"
+            test_url = f"{base_url}/test-00000-of-00001.parquet"
 
-            with open(source_path, 'w', encoding='utf-8') as f_src, \
-                 open(target_path, 'w', encoding='utf-8') as f_tgt:
-                count = 0
-                for item in tqdm(test_data, desc="Processing MS-MARCO"):
-                    if self._limit_reached(count):
-                        break
-                    query = item.get('query', item.get('question', ''))
-                    answers = item.get('wellFormedAnswers', item.get('answers', []))
-                    
-                    # Handle passages if answers not available
-                    if not answers and 'passages' in item:
-                        passages = item.get('passages', {})
-                        if isinstance(passages, dict) and 'passage_text' in passages:
-                            answers = passages['passage_text'][:1]  # Take first passage
-                    
-                    if query and answers:
-                        f_src.write(str(query).strip() + '\n')
-                        # Handle different answer formats
-                        if isinstance(answers, list) and len(answers) > 0:
-                            answer = answers[0] if isinstance(answers[0], str) else str(answers[0])
-                            f_tgt.write(f"{str(query).strip()}\t['{answer.strip()}']\n")
-                            count += 1
-                        elif isinstance(answers, str):
-                            f_tgt.write(f"{str(query).strip()}\t['{answers.strip()}']\n")
-                            count += 1
+            parquet_path = self.output_dir / "msmarco_validation.parquet"
+            ensure_min_size(parquet_path, 50 * 1024 * 1024, "MS-MARCO validation parquet")
+            downloaded = self.download_file(validation_url, parquet_path)
+            if not downloaded:
+                parquet_path = self.output_dir / "msmarco_test.parquet"
+                ensure_min_size(parquet_path, 50 * 1024 * 1024, "MS-MARCO test parquet")
+                downloaded = self.download_file(test_url, parquet_path)
 
-            print(f"  Created {source_path} ({count} samples)")
+            if not downloaded:
+                raise RuntimeError("Failed to download MS-MARCO parquet files")
+
+            count = write_msmarco_parquet(parquet_path)
+            print(f"  Created {self.output_dir / 'msmarco_test.source'} ({count} samples)")
+            if self.max_samples is None and count < 1000:
+                raise RuntimeError(f"MS-MARCO parquet parsing produced too few samples ({count})")
             return count
         except Exception as e:
-            print(f"  Failed with ms_marco v1.1: {e}")
+            print(f"  Failed with parquet MS-MARCO v2.1: {e}")
 
-        # Strategy 2: Try microsoft/ms_marco v2.1
+        # Strategy 2: Try microsoft/ms_marco v2.1 dataset script
         try:
             print("Attempting MS-MARCO from microsoft/ms_marco v2.1...")
             dataset = load_dataset("microsoft/ms_marco", "v2.1")
             print(f"  Successfully loaded MS-MARCO v2.1")
             
             test_data = dataset.get('validation', dataset.get('test', dataset.get('train')))
-            
-            source_path = self.output_dir / "msmarco_test.source"
-            target_path = self.output_dir / "msmarco_test.target"
-
-            with open(source_path, 'w', encoding='utf-8') as f_src, \
-                 open(target_path, 'w', encoding='utf-8') as f_tgt:
-                count = 0
-                for item in tqdm(test_data, desc="Processing MS-MARCO"):
-                    if self._limit_reached(count):
-                        break
-                    query = item.get('query', '')
-                    answers = item.get('wellFormedAnswers', item.get('answers', []))
-                    if query and answers:
-                        f_src.write(query.strip() + '\n')
-                        answer_str = str(answers)
-                        f_tgt.write(f"{query.strip()}\t{answer_str}\n")
-                        count += 1
-
-            print(f"  Created {source_path} ({count} samples)")
-            return count
+            return write_msmarco_split(test_data)
         except Exception as e:
             print(f"  Failed with microsoft/ms_marco: {e}")
 
@@ -493,90 +558,130 @@ class DatasetPreparer:
             print("  Successfully loaded MS-MARCO v1.1")
             
             test_data = dataset.get('validation', dataset.get('test', dataset.get('train')))
-            
-            source_path = self.output_dir / "msmarco_test.source"
-            target_path = self.output_dir / "msmarco_test.target"
-
-            with open(source_path, 'w', encoding='utf-8') as f_src, \
-                 open(target_path, 'w', encoding='utf-8') as f_tgt:
-                count = 0
-                for item in tqdm(test_data, desc="Processing MS-MARCO"):
-                    if self._limit_reached(count):
-                        break
-                    query = item.get('query', item.get('question', ''))
-                    answers = item.get('wellFormedAnswers', item.get('answers', item.get('passages', {}).get('passage_text', [])))
-                    
-                    if query and answers:
-                        f_src.write(str(query).strip() + '\n')
-                        # Handle different answer formats
-                        if isinstance(answers, list) and len(answers) > 0:
-                            answer = answers[0] if isinstance(answers[0], str) else str(answers[0])
-                            f_tgt.write(f"{str(query).strip()}\t['{answer.strip()}']\n")
-                            count += 1
-                        elif isinstance(answers, str):
-                            f_tgt.write(f"{str(query).strip()}\t['{answers.strip()}']\n")
-                            count += 1
-
-            print(f"  Created {source_path} ({count} samples)")
-            return count
+            return write_msmarco_split(test_data)
         except Exception as e:
             print(f"  Failed with ms_marco v1.1: {e}")
         
         print("\nAll MS-MARCO loading strategies failed.")
-        print("\n⚠️  MS-MARCO requires manual download in Modal environment:")
-        print("  Reason: Microsoft's blob storage returns 409 errors")
-        print("  FlashRAG incompatible with datasets==1.18.0 (used in Modal)")
-        print("\nTo use MS-MARCO:")
-        print("  1. Download from: https://www.kaggle.com/datasets/parthplc/ms-marco-dataset/data")
-        print("  2. Upload 'ms-marco-train.csv' and 'ms-marco-valid.csv' to Modal volume:")
-        print("     modal volume put rag-data ms-marco-train.csv eval_datasets/ms-marco-train.csv")
-        print("     modal volume put rag-data ms-marco-valid.csv eval_datasets/ms-marco-valid.csv")
-        print("  3. Re-run dataset preparation")
-        print("\nNote: MS-MARCO is optional - core benchmarks (NQ, TriviaQA, WebQ, Trec) work ✓")
+        print("\n⚠️  MS-MARCO requires a working parquet reader or manual CSV download.")
+        print("  - Recommended: install pyarrow and use the parquet strategy above.")
+        print("    pip install pyarrow")
+        print("  - Alternate: download from Kaggle and place:")
+        print("      ms-marco-train.csv, ms-marco-valid.csv in eval_datasets/")
+        print("    Then re-run dataset preparation.")
         return 0
 
     def prepare_searchqa(self):
         """Prepare SearchQA (Jeopardy) dataset from HuggingFace."""
         print("\n=== Preparing SearchQA (Jeopardy) ===")
 
-        # Strategy 1: Try original kyunghyuncho/search_qa
-        # Note: This requires datasets==1.18.0 (has dataset script support)
+        # Strategy 1: Download from HuggingFace dataset zip files
         try:
-            print("Attempting SearchQA from kyunghyuncho/search_qa...")
-            # This works with datasets 1.18.0 but not newer versions
-            dataset = load_dataset("kyunghyuncho/search_qa", "train_test_val")
-            print("  Successfully loaded SearchQA")
+            print("Attempting SearchQA from HuggingFace zip files...")
+            base_url = "https://huggingface.co/datasets/kyunghyuncho/search_qa/resolve/main/data/train_test_val"
+            test_zip_url = f"{base_url}/test.zip"
+            zip_path = self.output_dir / "searchqa_test.zip"
 
-            # Use test split
-            test_data = dataset['test']
+            if zip_path.exists() and zip_path.stat().st_size < 100 * 1024 * 1024:
+                size_mb = zip_path.stat().st_size / (1024 * 1024)
+                print(f"  ⚠ SearchQA test.zip too small ({size_mb:.1f} MB), re-downloading...")
+                zip_path.unlink(missing_ok=True)
+
+            downloaded = self.download_file(test_zip_url, zip_path)
+            if not downloaded:
+                raise RuntimeError("Download failed")
+
+            def iter_items_from_member(raw_bytes):
+                if not raw_bytes:
+                    return []
+                text = raw_bytes.decode('utf-8', errors='ignore').strip()
+                if not text:
+                    return []
+                try:
+                    data = json.loads(text)
+                    if isinstance(data, list):
+                        return data
+                    if isinstance(data, dict):
+                        return [data]
+                except json.JSONDecodeError:
+                    items = []
+                    for line in text.splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            items.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            continue
+                    return items
+                return []
 
             source_path = self.output_dir / "searchqa_test.source"
             target_path = self.output_dir / "searchqa_test.target"
 
+            count = 0
+            with zipfile.ZipFile(zip_path, 'r') as zf, \
+                 open(source_path, 'w', encoding='utf-8') as f_src, \
+                 open(target_path, 'w', encoding='utf-8') as f_tgt:
+                members = [m for m in zf.namelist()
+                           if not m.endswith('/') and "__MACOSX" not in m]
+                if not members:
+                    raise RuntimeError("No files found inside searchqa test.zip")
+
+                for member in members:
+                    if self._limit_reached(count):
+                        break
+                    with zf.open(member) as raw:
+                        raw_bytes = raw.read()
+                    if member.endswith('.gz'):
+                        raw_bytes = gzip.decompress(raw_bytes)
+                    items = iter_items_from_member(raw_bytes)
+                    for data in items:
+                        if self._limit_reached(count):
+                            break
+                        question = data.get('question', data.get('query', ''))
+                        answer = data.get('answer', data.get('answers', ''))
+
+                        if isinstance(answer, list) and answer:
+                            answer = answer[0]
+
+                        question = str(question).strip() if question else ''
+                        answer = str(answer).strip() if answer else ''
+
+                        if question and answer:
+                            f_src.write(question + '\n')
+                            f_tgt.write(f"{question}\t['{answer}']\n")
+                            count += 1
+
+            print(f"  Created {source_path} ({count} samples)")
+            if self.max_samples is None and count < 1000:
+                raise RuntimeError(f"SearchQA zip parsing produced too few samples ({count})")
+            return count
+        except Exception as e:
+            print(f"  Failed with zip download: {e}")
+
+        # Strategy 2: Try original dataset script (older datasets versions)
+        try:
+            print("Attempting SearchQA from kyunghyuncho/search_qa dataset script...")
+            dataset = load_dataset("kyunghyuncho/search_qa", "train_test_val")
+            print("  Successfully loaded SearchQA")
+
+            test_data = dataset['test']
+            source_path = self.output_dir / "searchqa_test.source"
+            target_path = self.output_dir / "searchqa_test.target"
+
+            count = 0
             with open(source_path, 'w', encoding='utf-8') as f_src, \
                  open(target_path, 'w', encoding='utf-8') as f_tgt:
-                count = 0
                 for item in tqdm(test_data, desc="Processing SearchQA"):
                     if self._limit_reached(count):
                         break
-                    # Extract question and answer fields
                     question = item.get('question', '')
                     answer = item.get('answer', '')
-                    
-                    # Handle if answer is a list
-                    if isinstance(answer, list) and len(answer) > 0:
+                    if isinstance(answer, list) and answer:
                         answer = answer[0]
-                    
-                    # Handle if answer/question are bytes
-                    if isinstance(question, bytes):
-                        question = question.decode('utf-8', errors='ignore')
-                    if isinstance(answer, bytes):
-                        answer = answer.decode('utf-8', errors='ignore')
-                    
-                    # Convert to string and clean
                     question = str(question).strip() if question else ''
                     answer = str(answer).strip() if answer else ''
-
                     if question and answer:
                         f_src.write(question + '\n')
                         f_tgt.write(f"{question}\t['{answer}']\n")
@@ -584,88 +689,13 @@ class DatasetPreparer:
 
             print(f"  Created {source_path} ({count} samples)")
             return count
-        except RuntimeError as e:
-            if "Dataset scripts are no longer supported" in str(e):
-                print(f"  ⚠ Dataset script not supported in this datasets version")
-                print(f"    This dataset requires datasets==1.18.0 (used in Modal)")
-            else:
-                print(f"  Failed with kyunghyuncho/search_qa: {e}")
         except Exception as e:
-            print(f"  Failed with kyunghyuncho/search_qa: {e}")
-            import traceback
-            print(f"  Full traceback:")
-            traceback.print_exc()
+            print(f"  Failed with dataset script: {e}")
 
-        # Strategy 2: Try direct file download from HuggingFace (fallback)
-        try:
-            print("Attempting direct download from HuggingFace repository...")
-            import urllib.request
-            import gzip
-            
-            # SearchQA test file URL - files are in root directory, not /data subfolder
-            base_url = "https://huggingface.co/datasets/kyunghyuncho/search_qa/resolve/main"
-            test_file_url = f"{base_url}/test.txt.gz"
-            
-            temp_gz_path = self.output_dir / "searchqa_test.txt.gz"
-            temp_txt_path = self.output_dir / "searchqa_test.txt"
-            
-            print(f"  Downloading {test_file_url}...")
-            req = urllib.request.Request(
-                test_file_url,
-                headers={'User-Agent': 'Mozilla/5.0'}
-            )
-            with urllib.request.urlopen(req, timeout=60) as response:
-                with open(temp_gz_path, 'wb') as f:
-                    f.write(response.read())
-            
-            # Decompress
-            print(f"  Decompressing...")
-            with gzip.open(temp_gz_path, 'rb') as f_in:
-                with open(temp_txt_path, 'wb') as f_out:
-                    f_out.write(f_in.read())
-            
-            # Parse and convert to eval format
-            source_path = self.output_dir / "searchqa_test.source"
-            target_path = self.output_dir / "searchqa_test.target"
-            
-            count = 0
-            with open(temp_txt_path, 'r', encoding='utf-8') as f_in, \
-                 open(source_path, 'w', encoding='utf-8') as f_src, \
-                 open(target_path, 'w', encoding='utf-8') as f_tgt:
-                
-                for line in f_in:
-                    if self._limit_reached(count):
-                        break
-                    line = line.strip()
-                    if line:
-                        # Parse JSON line
-                        try:
-                            data = json.loads(line)
-                            question = data.get('question', '')
-                            answer = data.get('answer', '')
-                            
-                            if question and answer:
-                                f_src.write(question + '\\n')
-                                f_tgt.write(f"{question}\\t['{answer}']\\n")
-                                count += 1
-                        except json.JSONDecodeError:
-                            continue
-            
-            # Cleanup temp files
-            temp_gz_path.unlink(missing_ok=True)
-            temp_txt_path.unlink(missing_ok=True)
-            
-            print(f"  Created {source_path} ({count} samples)")
-            return count
-            
-        except Exception as e:
-            print(f"  Failed with direct download: {e}")
-        
         print("All SearchQA loading strategies failed.")
         print("⚠  SearchQA appears to have data corruption issues")
         print("  Dataset downloads but JSON parsing fails - known issue in repository")
         print("\nSearchQA will be skipped. This is an optional dataset - core benchmarks work ✓")
-        return 0
         return 0
 
     def prepare_fever(self):

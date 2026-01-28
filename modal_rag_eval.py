@@ -35,12 +35,13 @@ image = (
     .apt_install("git")  # Needed for GitPython
     .pip_install(
         # Core dependencies with strict version control for compatibility
-        "numpy>=1.19.0,<2.0.0",  # Pin to 1.x for pyarrow/datasets compatibility
+        "numpy>=1.19.0,<1.24.0",  # Avoid np.object removal in numpy>=1.24 (datasets 1.18.0 uses it)
         "pyarrow>=6.0.0,<15.0.0",  # Compatible with datasets 1.18.0 (needs PyExtensionType, removed in 21.0.0)
         "datasets==1.18.0",  # Pin as requested
         "transformers==4.30.2",  # Specific version known to work with datasets 1.18.0 and torch 2.0
         "torch==2.0.1",  # Pin specific version for stability
         "faiss-cpu==1.7.4",  # Pin for reproducibility
+        "hf_transfer>=0.1.6",  # Optional: faster HF Hub downloads when enabled
         "pandas>=1.3.0,<2.0.0",  # 1.x series for compatibility
         "tqdm>=4.60.0",
         "psutil>=5.8.0",
@@ -135,6 +136,12 @@ def parse_metrics_from_output(output: str) -> Dict[str, float]:
     return metrics
 
 
+def parse_csv_arg(value: str) -> List[str]:
+    if not value:
+        return []
+    return [v.strip() for v in value.split(',') if v.strip()]
+
+
 def format_comparison_table(results: List[Dict]) -> str:
     """Format results as a comparison table with paper results."""
     lines = []
@@ -176,7 +183,7 @@ def format_comparison_table(results: List[Dict]) -> str:
 @app.function(
     image=image,
     volumes={VOLUME_PATH: volume},
-    timeout=7200,  # 2 hours for initial index download
+    timeout=43200,  # 12 hours for initial index download
     cpu=8.0,
     memory=16384,  # 16GB RAM
 )
@@ -193,6 +200,14 @@ def setup_wiki_index():
     os.environ['HF_HOME'] = HF_CACHE_DIR
     os.environ['HF_DATASETS_CACHE'] = f"{HF_CACHE_DIR}/datasets"
     os.environ['TRANSFORMERS_CACHE'] = f"{HF_CACHE_DIR}/transformers"
+    os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = "1"
+    os.environ['HF_XET_HIGH_PERFORMANCE'] = "1"
+
+    try:
+        import huggingface_hub
+        print(f"huggingface_hub version: {huggingface_hub.__version__}")
+    except Exception as e:
+        print(f"⚠ Unable to read huggingface_hub version: {e}")
     
     # Set HF_TOKEN if available (for gated/private datasets)
     # Note: Set this in Modal secrets if needed for private datasets
@@ -243,6 +258,79 @@ def setup_wiki_index():
 @app.function(
     image=image,
     volumes={VOLUME_PATH: volume},
+    timeout=43200,  # 12 hours for passages download
+    cpu=8.0,
+    memory=16384,
+)
+def setup_wiki_passages():
+    """
+    Download wiki_dpr passages (psgs_w100.nq.no_index) to Modal volume.
+    This is a one-time operation (~139GB total download+generated size).
+    """
+    print("=" * 80)
+    print("Setting up wiki_dpr passages (psgs_w100.nq.compressed)")
+    print("=" * 80)
+
+    # Set HuggingFace cache to volume
+    os.environ['HF_HOME'] = HF_CACHE_DIR
+    os.environ['HF_DATASETS_CACHE'] = f"{HF_CACHE_DIR}/datasets"
+    os.environ['TRANSFORMERS_CACHE'] = f"{HF_CACHE_DIR}/transformers"
+    os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = "1"
+    os.environ['HF_XET_HIGH_PERFORMANCE'] = "1"
+
+    try:
+        import huggingface_hub
+        print(f"huggingface_hub version: {huggingface_hub.__version__}")
+    except Exception as e:
+        print(f"⚠ Unable to read huggingface_hub version: {e}")
+
+    # Create directories
+    os.makedirs(HF_CACHE_DIR, exist_ok=True)
+
+    # Check marker + expected cache path (fast path: facebook___wiki_dpr)
+    passages_marker = Path(HF_CACHE_DIR) / "wiki_dpr_passages.marker"
+    expected_cache = (
+        Path(HF_CACHE_DIR)
+        / "datasets"
+        / "facebook___wiki_dpr"
+        / "psgs_w100.nq.compressed"
+    )
+    if passages_marker.exists() and expected_cache.exists():
+        print("✓ wiki_dpr passages already cached")
+        return {"status": "cached"}
+    if passages_marker.exists() and not expected_cache.exists():
+        print("⚠ Passages marker exists but expected cache not found. Proceeding to download.")
+
+    print("Downloading wiki_dpr passages (this will take a while)...")
+    print("Expected size: ~139GB (download+generated)")
+
+    try:
+        # Download passages dataset
+        from datasets import load_dataset
+
+        dataset = load_dataset(
+            "facebook/wiki_dpr",
+            "psgs_w100.nq.compressed",
+            split="train",
+            cache_dir=f"{HF_CACHE_DIR}/datasets",
+        )
+
+        print(f"✓ Passages loaded successfully: {len(dataset)} passages")
+
+        passages_marker.write_text("Passages downloaded successfully")
+        volume.commit()
+
+        print("✓ wiki_dpr passages setup complete")
+        return {"status": "success", "num_passages": len(dataset)}
+
+    except Exception as e:
+        print(f"✗ Error downloading passages: {e}")
+        raise
+
+
+@app.function(
+    image=image,
+    volumes={VOLUME_PATH: volume},
     timeout=3600,
     cpu=4.0,
 )
@@ -258,11 +346,10 @@ def prepare_datasets(max_samples: int = 0):
     # Check if datasets are already uploaded
     existing_datasets = []
     if os.path.exists(EVAL_DATASETS_DIR):
-        source_files = [f for f in os.listdir(EVAL_DATASETS_DIR) if f.endswith('.source')]
+        source_files = [f for f in os.listdir(EVAL_DATASETS_DIR) if f.endswith('_test.source')]
         if source_files:
-            existing_datasets = [f.replace('_test.source', '').replace('_dev.source', '') 
-                                for f in source_files]
-            print(f"\n✓ Found {len(source_files)} pre-uploaded dataset files:")
+            existing_datasets = [f.replace('_test.source', '') for f in source_files]
+            print(f"\n✓ Found {len(source_files)} pre-uploaded test dataset files:")
             for f in sorted(source_files):
                 size = os.path.getsize(os.path.join(EVAL_DATASETS_DIR, f)) / 1024
                 print(f"  • {f} ({size:.1f} KB)")
@@ -273,9 +360,19 @@ def prepare_datasets(max_samples: int = 0):
             print("  2. Or prepare locally and re-upload (see docs/DATASET_PREPARATION_GUIDE.md)")
             print()
             
-            # Create a minimal results file
-            results = {f.replace('_test.source', '').replace('_dev.source', ''): 1 
-                      for f in source_files}
+            # Create results with sample counts (only if target exists)
+            results = {}
+            for f in source_files:
+                dataset_name = f.replace('_test.source', '')
+                source_path = os.path.join(EVAL_DATASETS_DIR, f)
+                target_path = os.path.join(EVAL_DATASETS_DIR, f"{dataset_name}_test.target")
+                if not os.path.exists(target_path):
+                    print(f"  ⚠ Missing target file for {dataset_name}: {target_path}")
+                    results[dataset_name] = 0
+                    continue
+                with open(source_path, 'r') as fh:
+                    results[dataset_name] = sum(1 for _ in fh)
+
             results_file = f"{RESULTS_DIR}/dataset_preparation_results.json"
             os.makedirs(RESULTS_DIR, exist_ok=True)
             with open(results_file, 'w') as f:
@@ -286,7 +383,7 @@ def prepare_datasets(max_samples: int = 0):
                 }, f, indent=2)
             
             volume.commit()
-            return
+            return results
     
     # No pre-uploaded datasets found - proceed with preparation
     print("\n📥 No pre-uploaded datasets found, attempting in-container preparation...")
@@ -339,7 +436,7 @@ def prepare_datasets(max_samples: int = 0):
     image=image,
     gpu="T4",  # T4 GPU for cost-effective evaluation
     volumes={VOLUME_PATH: volume},
-    timeout=7200,  # 2 hours per evaluation (includes model download + index init + inference)
+    timeout=43200,  # 12 hours per evaluation (includes model download + index init + inference)
     cpu=4.0,
     memory=16384,
 )
@@ -348,6 +445,7 @@ def run_evaluation(
     model_type: str,
     eval_mode: str = "e2e",
     n_docs: int = 5,
+    eval_batch_size: int = 8,
 ) -> Dict:
     """
     Run evaluation for one dataset-model combination.
@@ -372,6 +470,8 @@ def run_evaluation(
     os.environ['HF_HOME'] = HF_CACHE_DIR
     os.environ['HF_DATASETS_CACHE'] = f"{HF_CACHE_DIR}/datasets"
     os.environ['TRANSFORMERS_CACHE'] = f"{HF_CACHE_DIR}/transformers"
+    os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = "1"
+    os.environ['HF_XET_HIGH_PERFORMANCE'] = "1"
 
     # Add CODE_DIR to PYTHONPATH for imports
     os.environ['PYTHONPATH'] = CODE_DIR + ':' + os.environ.get('PYTHONPATH', '')
@@ -405,6 +505,11 @@ def run_evaluation(
         }
 
     # Construct eval_rag.py command
+    recalculate = False
+    if os.path.exists(preds_path) and os.path.getsize(preds_path) == 0:
+        recalculate = True
+        print(f"⚠ Found empty predictions file, forcing recompute: {preds_path}")
+
     cmd = [
         'python', f'{CODE_DIR}/eval_rag.py',
         '--model_name_or_path', model_name,
@@ -415,14 +520,20 @@ def run_evaluation(
         '--predictions_path', preds_path,
         '--eval_mode', eval_mode,
         '--n_docs', str(n_docs),
-        '--eval_batch_size', '8',
+        '--eval_batch_size', str(eval_batch_size),
         '--print_predictions',
     ]
+    if recalculate:
+        cmd.append('--recalculate')
 
     # For RAG models, add index configuration
     # Explicitly specify compressed index to avoid URL validation errors
     if model_type in ['rag_sequence', 'rag_token']:
         cmd.extend(['--index_name', 'compressed'])
+        cmd.extend([
+            '--passages_dataset', 'facebook/wiki_dpr',
+            '--passages_config', 'psgs_w100.nq.compressed',
+        ])
 
     print(f"Running command: {' '.join(cmd)}")
 
@@ -528,6 +639,12 @@ def main(
     datasets_only: bool = False,
     test_mode: bool = False,
     max_samples: int = 0,
+    datasets: str = "",
+    models: str = "",
+    n_docs: int = 5,
+    eval_batch_size: int = 8,
+    eval_mode: str = "e2e",
+    results_file: str = "evaluation_results.json",
 ):
     """
     Main entrypoint for RAG evaluation on Modal.
@@ -542,6 +659,12 @@ def main(
                    - Estimating time/cost before committing to the full run
                    Expected time: ~2 hours, Cost: ~$3-5
         max_samples: Max samples per dataset (0 means no limit)
+        datasets: Comma-separated list of datasets to evaluate (e.g., "nq,triviaqa")
+        models: Comma-separated list of models to evaluate (rag_sequence, rag_token, bart)
+        n_docs: Number of documents to retrieve per query
+        eval_batch_size: Batch size for evaluation
+        eval_mode: Evaluation mode ("e2e" or "retrieval")
+        results_file: Output filename for evaluation results JSON
     """
     print("\n" + "=" * 80)
     print("RAG Paper Reproduction - Modal Evaluation")
@@ -551,7 +674,7 @@ def main(
     # This happens automatically via Modal's volume mounting
 
     # Step 1: Setup wiki_dpr index (one-time operation)
-    print("\n[1/4] Setting up wiki_dpr index...")
+    print("\n[1/5] Setting up wiki_dpr index...")
     setup_result = setup_wiki_index.remote()
     print(f"✓ Setup complete: {setup_result}")
 
@@ -560,7 +683,7 @@ def main(
         return
 
     # Step 2: Prepare evaluation datasets
-    print("\n[2/4] Preparing evaluation datasets...")
+    print("\n[2/5] Preparing evaluation datasets...")
     dataset_results = prepare_datasets.remote(max_samples=max_samples)
     print(f"✓ Datasets prepared: {dataset_results}")
 
@@ -568,23 +691,63 @@ def main(
         print("\nDataset preparation complete! Exiting as requested.")
         return
 
-    # Step 3: Run evaluations
-    print("\n[3/4] Running evaluations...")
+    # Step 3: Setup wiki_dpr passages (one-time operation)
+    print("\n[3/5] Setting up wiki_dpr passages...")
+    passages_result = setup_wiki_passages.remote()
+    print(f"✓ Passages setup complete: {passages_result}")
+
+    # Step 4: Run evaluations
+    print("\n[4/5] Running evaluations...")
+
+    if eval_mode not in ["e2e", "retrieval"]:
+        print(f"✗ Invalid eval_mode: {eval_mode} (expected 'e2e' or 'retrieval')")
+        return []
 
     if test_mode:
         print("⚠ Test mode: Running single evaluation only (NQ × RAG-Sequence)")
         print("  This is a quick validation run to ensure the pipeline works.")
         print("  Expected: ~2 hours, ~$3-5")
+        if datasets or models:
+            print("  Note: --datasets/--models ignored in test mode")
         datasets_to_eval = ['nq']
         models_to_eval = ['rag_sequence']
     else:
-        # Filter to only datasets that were successfully prepared
-        datasets_to_eval = [d for d in DATASETS if dataset_results.get(d, 0) > 0]
-        if not datasets_to_eval:
-            print("✗ No datasets were successfully prepared!")
+        available_datasets = list_datasets.remote()
+        if not available_datasets:
+            print("✗ No datasets found on Modal volume!")
             return []
+
+        base_datasets = [d for d in DATASETS if d in available_datasets]
+        if datasets:
+            requested = parse_csv_arg(datasets)
+            invalid = [d for d in requested if d not in base_datasets]
+            if invalid:
+                print(f"⚠ Ignoring unknown/unavailable datasets: {', '.join(invalid)}")
+            datasets_to_eval = [d for d in requested if d in base_datasets]
+        else:
+            datasets_to_eval = base_datasets
+
+        if not datasets_to_eval:
+            print("✗ No valid datasets selected!")
+            return []
+
+        available_models = list(MODELS.keys())
+        if models:
+            requested_models = parse_csv_arg(models)
+            invalid_models = [m for m in requested_models if m not in available_models]
+            if invalid_models:
+                print(f"⚠ Ignoring unknown models: {', '.join(invalid_models)}")
+            models_to_eval = [m for m in requested_models if m in available_models]
+        else:
+            models_to_eval = available_models
+
+        if not models_to_eval:
+            print("✗ No valid models selected!")
+            return []
+
         print(f"Evaluating on {len(datasets_to_eval)} datasets: {', '.join(datasets_to_eval)}")
-        models_to_eval = list(MODELS.keys())
+        print(f"Models: {', '.join(models_to_eval)}")
+        print(f"n_docs={n_docs}, eval_batch_size={eval_batch_size}, eval_mode={eval_mode}")
 
     # Run all evaluations
     results = []
@@ -599,8 +762,9 @@ def main(
             result = run_evaluation.remote(
                 dataset_name=dataset,
                 model_type=model,
-                eval_mode='e2e',
-                n_docs=5,
+                eval_mode=eval_mode,
+                n_docs=n_docs,
+                eval_batch_size=eval_batch_size,
             )
 
             results.append(result)
@@ -612,24 +776,27 @@ def main(
             else:
                 print(f"  ✗ Error: {result.get('error', 'Unknown error')}")
 
-    # Step 4: Save results and generate comparison
-    print("\n[4/4] Generating results...")
+    # Step 5: Save results and generate comparison
+    print("\n[5/5] Generating results...")
 
     # Save raw results
-    save_results.remote(results, "evaluation_results.json")
+    save_results.remote(results, results_file)
 
     # Generate comparison table
     comparison = format_comparison_table(results)
     print("\n" + comparison)
 
-    # Save comparison table
-    comparison_path = f"{RESULTS_DIR}/comparison_table.txt"
-    with open(comparison_path.replace(RESULTS_DIR, "./results"), 'w') as f:
+    # Save comparison table (unique per results file)
+    comparison_name = Path(results_file).name.replace(".json", "")
+    local_results_dir = Path("./results")
+    local_results_dir.mkdir(parents=True, exist_ok=True)
+    comparison_path = local_results_dir / f"comparison_table_{comparison_name}.txt"
+    with open(comparison_path, 'w') as f:
         f.write(comparison)
 
     print(f"\n✓ All evaluations complete!")
-    print(f"  Results saved to: ./results/evaluation_results.json")
-    print(f"  Comparison table: ./results/comparison_table.txt")
+    print(f"  Results saved to: ./results/{results_file}")
+    print(f"  Comparison table: {comparison_path}")
 
     # Calculate success rate
     successful = sum(1 for r in results if r['status'] == 'success')
@@ -651,7 +818,7 @@ def list_datasets():
     """List all prepared datasets in the volume."""
     import glob
 
-    dataset_files = glob.glob(f"{EVAL_DATASETS_DIR}/*.source")
+    dataset_files = glob.glob(f"{EVAL_DATASETS_DIR}/*_test.source")
     datasets = [Path(f).stem.replace('_test', '') for f in dataset_files]
 
     print("Available datasets:")
@@ -695,6 +862,42 @@ def get_dataset_logs():
     image=image,
     volumes={VOLUME_PATH: volume},
 )
+def aggregate_results(results_prefix: str = "evaluation_results"):
+    """Aggregate multiple results JSONs on the volume and generate a combined comparison table."""
+    import glob
+
+    pattern = f"{RESULTS_DIR}/{results_prefix}*.json"
+    result_files = sorted(glob.glob(pattern))
+    if not result_files:
+        msg = f"No results files found for pattern: {pattern}"
+        print(msg)
+        return {"status": "empty", "message": msg, "files": []}
+
+    results = []
+    for path in result_files:
+        try:
+            with open(path, "r") as f:
+                results.extend(json.load(f))
+        except Exception as e:
+            print(f"⚠ Skipping {path}: {e}")
+
+    comparison = format_comparison_table(results)
+    output_path = f"{RESULTS_DIR}/comparison_table_aggregate.txt"
+    with open(output_path, "w") as f:
+        f.write(comparison)
+
+    volume.commit()
+
+    print(f"✓ Aggregated {len(result_files)} files")
+    print(f"✓ Comparison table saved to {output_path}")
+
+    return {"status": "ok", "files": result_files, "output": output_path}
+
+
+@app.function(
+    image=image,
+    volumes={VOLUME_PATH: volume},
+)
 def cleanup_results():
     """Clean up results directory."""
     import shutil
@@ -704,6 +907,67 @@ def cleanup_results():
         os.makedirs(RESULTS_DIR, exist_ok=True)
         volume.commit()
         print("✓ Results directory cleaned")
+
+
+@app.function(
+    image=image,
+    volumes={VOLUME_PATH: volume},
+)
+def cache_status():
+    """Report cache status and sizes for wiki_dpr datasets on the volume."""
+    import glob
+    import subprocess
+
+    def du(path: str):
+        if not os.path.exists(path):
+            return None
+        try:
+            out = subprocess.check_output(["du", "-sh", path], text=True).strip()
+            return out.split()[0] if out else None
+        except Exception:
+            return None
+
+    marker = f"{HF_CACHE_DIR}/wiki_dpr_compressed.marker"
+    passages_marker = f"{HF_CACHE_DIR}/wiki_dpr_passages.marker"
+    dataset_roots = [
+        f"{HF_CACHE_DIR}/datasets/wiki_dpr",
+        f"{HF_CACHE_DIR}/datasets/facebook___wiki_dpr",
+    ]
+    no_index = []
+    compressed = []
+    for root in dataset_roots:
+        no_index.extend(glob.glob(f"{root}/psgs_w100.nq.no_index*"))
+        compressed.extend(glob.glob(f"{root}/psgs_w100.nq.compressed*"))
+    no_index = sorted(set(no_index))
+    compressed = sorted(set(compressed))
+
+    status = {
+        "hf_cache_dir": {"path": HF_CACHE_DIR, "exists": os.path.exists(HF_CACHE_DIR), "size": du(HF_CACHE_DIR)},
+        "marker": {"path": marker, "exists": os.path.exists(marker)},
+        "passages_marker": {"path": passages_marker, "exists": os.path.exists(passages_marker)},
+        "dataset_roots": [
+            {"path": root, "exists": os.path.exists(root), "size": du(root)}
+            for root in dataset_roots
+        ],
+        "no_index": [{"path": p, "size": du(p)} for p in no_index],
+        "compressed": [{"path": p, "size": du(p)} for p in compressed],
+    }
+
+    print("Cache status:")
+    print(f"  HF cache: {status['hf_cache_dir']}")
+    print(f"  Marker: {status['marker']}")
+    print(f"  Passages marker: {status['passages_marker']}")
+    print("  Dataset roots:")
+    for entry in status["dataset_roots"]:
+        print(f"    - {entry}")
+    print(f"  no_index entries: {len(status['no_index'])}")
+    for entry in status["no_index"]:
+        print(f"    - {entry}")
+    print(f"  compressed entries: {len(status['compressed'])}")
+    for entry in status["compressed"]:
+        print(f"    - {entry}")
+
+    return status
 
 
 # ============================================================================
@@ -717,6 +981,9 @@ modal run modal_rag_eval.py
 # Only setup wiki_dpr index:
 modal run modal_rag_eval.py --setup-only
 
+# Only setup wiki_dpr passages:
+modal run modal_rag_eval.py::setup_wiki_passages
+
 # Only prepare datasets:
 modal run modal_rag_eval.py --datasets-only
 
@@ -726,9 +993,21 @@ modal run modal_rag_eval.py --test-mode
 # Limit dataset size for faster runs:
 modal run modal_rag_eval.py --max-samples 200
 
+# Run a single dataset/model with faster settings:
+modal run modal_rag_eval.py --datasets nq --models rag_sequence --n-docs 1 --eval-batch-size 8
+
+# Run with a unique results file (parallel-safe):
+modal run modal_rag_eval.py --datasets nq --models rag_sequence --results-file evaluation_results_nq.json
+
 # List available datasets:
 modal run modal_rag_eval.py::list_datasets
 
 # Clean up results:
 modal run modal_rag_eval.py::cleanup_results
+
+# Check cache status:
+modal run modal_rag_eval.py::cache_status
+
+# Aggregate results from multiple runs:
+modal run modal_rag_eval.py::aggregate_results
 """

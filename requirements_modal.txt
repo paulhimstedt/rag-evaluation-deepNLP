@@ -2,7 +2,7 @@
 # Strict version pinning for maximum compatibility with Python 3.10+
 
 # Core dependencies - ORDER MATTERS for proper resolution
-numpy>=1.19.0,<2.0.0     # Pin to 1.x for pyarrow/datasets compatibility (numpy 2.x breaks old packages)
+numpy>=1.19.0,<1.24.0     # Avoid np.object removal in numpy>=1.24 (datasets 1.18.0 uses it)
 pyarrow>=6.0.0,<15.0.0   # Compatible with datasets 1.18.0 (needs PyExtensionType, removed in 21.0.0)
 datasets==1.18.0          # Pin as requested
 transformers==4.30.2      # Specific version tested to work with this stack

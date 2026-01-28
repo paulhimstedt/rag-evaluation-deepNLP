@@ -57,6 +57,10 @@ def get_scores(args, preds_path, gold_data_path):
         em += metric_max_over_ground_truths(exact_match_score, prediction, ground_truths)
         f1 += metric_max_over_ground_truths(f1_score, prediction, ground_truths)
 
+    if total == 0:
+        logger.warning("No predictions found in %s; skipping metrics.", preds_path)
+        return
+
     em = 100.0 * em / total
     f1 = 100.0 * f1 / total
 
@@ -249,6 +253,18 @@ def get_args():
         action="store_true",
         help="If True, prints docs retried while generating.",
     )
+    parser.add_argument(
+        "--passages_dataset",
+        default=None,
+        type=str,
+        help="Optional dataset name to load passages explicitly (e.g., facebook/wiki_dpr).",
+    )
+    parser.add_argument(
+        "--passages_config",
+        default=None,
+        type=str,
+        help="Optional dataset config for passages (e.g., psgs_w100.nq.no_index).",
+    )
     args = parser.parse_args()
     args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return args
@@ -280,6 +296,30 @@ def main(args):
     score_fn = get_scores if args.eval_mode == "e2e" else get_precision_at_k
     evaluate_batch_fn = evaluate_batch_e2e if args.eval_mode == "e2e" else evaluate_batch_retrieval
 
+    indexed_dataset = None
+    if args.model_type.startswith("rag") and args.passages_dataset:
+        from datasets import load_dataset
+
+        logger.info(
+            "Loading passages dataset explicitly: %s (%s)",
+            args.passages_dataset,
+            args.passages_config or "default",
+        )
+        indexed_dataset = load_dataset(
+            args.passages_dataset,
+            args.passages_config,
+            split="train",
+            cache_dir=os.environ.get("HF_DATASETS_CACHE"),
+        )
+        cache_files = getattr(indexed_dataset, "cache_files", None)
+        if cache_files:
+            logger.info("Passages cache files: %s", cache_files)
+        try:
+            indexes = indexed_dataset.list_indexes()
+            logger.info("Passages dataset indexes: %s", indexes)
+        except Exception as e:
+            logger.info("Passages dataset indexes unavailable: %s", e)
+
     for checkpoint in checkpoints:
         if os.path.exists(args.predictions_path) and (not args.recalculate):
             logger.info("Calculating metrics based on an existing predictions file: {}".format(args.predictions_path))
@@ -291,7 +331,11 @@ def main(args):
         logger.info("  Predictions will be stored under {}".format(args.predictions_path))
 
         if args.model_type.startswith("rag"):
-            retriever = RagRetriever.from_pretrained(checkpoint, **model_kwargs)
+            retriever = RagRetriever.from_pretrained(
+                checkpoint,
+                indexed_dataset=indexed_dataset,
+                **model_kwargs,
+            )
             model = model_class.from_pretrained(checkpoint, retriever=retriever, **model_kwargs)
             model.retriever.init_retrieval()
         else:
