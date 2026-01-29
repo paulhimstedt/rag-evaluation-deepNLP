@@ -60,6 +60,8 @@ def main():
         paths = [p.strip() for p in args.results_files.split(",") if p.strip()]
     else:
         paths = glob.glob(f"{args.results_dir}/*.json")
+        if not paths:
+            paths = glob.glob(f"{args.results_dir}/results/*.json")
 
     results = load_results(paths)
     if not results:

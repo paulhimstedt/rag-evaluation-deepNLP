@@ -545,7 +545,8 @@ def run_evaluation(
     # Construct paths
     source_path = f"{EVAL_DATASETS_DIR}/{dataset_name}_test.source"
     target_path = f"{EVAL_DATASETS_DIR}/{dataset_name}_test.target"
-    preds_path = f"{RESULTS_DIR}/{dataset_name}_{model_type}_k{n_docs}_preds.txt"
+    sample_suffix = f"_s{max_eval_samples}" if max_eval_samples and max_eval_samples > 0 else ""
+    preds_path = f"{RESULTS_DIR}/{dataset_name}_{model_type}_k{n_docs}{sample_suffix}_preds.txt"
 
     # Create results directory
     os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -590,6 +591,8 @@ def run_evaluation(
         cmd.extend(['--num_beams', str(num_beams)])
     if eval_mode == "retrieval":
         cmd.extend(['--k', str(n_docs)])
+    if dataset_name == "msmarco" and eval_mode == "e2e":
+        cmd.append('--skip_scores')
     if max_eval_samples and max_eval_samples > 0:
         cmd.extend(['--max_eval_samples', str(max_eval_samples)])
     if recalculate:
@@ -992,6 +995,7 @@ def main(
     eval_mode: str = "e2e",
     results_file: str = "evaluation_results.json",
     num_beams: int = 0,
+    skip_local_results: bool = False,
 ):
     """
     Main entrypoint for RAG evaluation on Modal.
@@ -1014,6 +1018,7 @@ def main(
         eval_mode: Evaluation mode ("e2e" or "retrieval")
         results_file: Output filename for evaluation results JSON
         num_beams: Beam size override (0 means default from eval_rag.py)
+        skip_local_results: Skip writing local comparison table/results files
     """
     print("\n" + "=" * 80)
     print("RAG Paper Reproduction - Modal Evaluation")
@@ -1097,7 +1102,10 @@ def main(
 
         print(f"Evaluating on {len(datasets_to_eval)} datasets: {', '.join(datasets_to_eval)}")
         print(f"Models: {', '.join(models_to_eval)}")
-        print(f"n_docs={n_docs}, eval_batch_size={eval_batch_size}, eval_mode={eval_mode}, num_beams={num_beams or 'default'}")
+        print(
+            f"n_docs={n_docs}, eval_batch_size={eval_batch_size}, "
+            f"eval_mode={eval_mode}, num_beams={num_beams or 'default'}"
+        )
 
     # Run all evaluations
     results = []
@@ -1145,16 +1153,23 @@ def main(
     print("\n" + comparison)
 
     # Save comparison table (unique per results file)
-    comparison_name = Path(results_file).name.replace(".json", "")
-    local_results_dir = Path("./results")
-    local_results_dir.mkdir(parents=True, exist_ok=True)
-    comparison_path = local_results_dir / f"comparison_table_{comparison_name}.txt"
-    with open(comparison_path, 'w') as f:
-        f.write(comparison)
+    if not skip_local_results:
+        comparison_name = Path(results_file).name.replace(".json", "")
+        local_results_dir = Path("./results")
+        local_results_dir.mkdir(parents=True, exist_ok=True)
+        comparison_path = local_results_dir / f"comparison_table_{comparison_name}.txt"
+        with open(comparison_path, 'w') as f:
+            f.write(comparison)
 
     print(f"\n✓ All evaluations complete!")
-    print(f"  Results saved to: ./results/{results_file}")
-    print(f"  Comparison table: {comparison_path}")
+    if not skip_local_results:
+        print(f"  Results saved to: ./results/{results_file}")
+    else:
+        print("  Results saved to: (skipped local write)")
+    if not skip_local_results:
+        print(f"  Comparison table: {comparison_path}")
+    else:
+        print("  Comparison table: (skipped local write)")
 
     # Calculate success rate
     successful = sum(1 for r in results if r['status'] == 'success')

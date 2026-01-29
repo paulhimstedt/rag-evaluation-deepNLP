@@ -39,6 +39,7 @@ Complete documentation for the RAG evaluation workflow.
 | **[DATASET_STATUS.md](DATASET_STATUS.md)** | Current status of all 7 datasets | All users |
 | **[DATASET_ISSUES.md](DATASET_ISSUES.md)** | Known dataset issues and workarounds | Troubleshooting |
 | **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** | Common problems and solutions | Problem solvers |
+| **[README_TRANSFORMERS_ORIGINAL.md](README_TRANSFORMERS_ORIGINAL.md)** | Legacy README from the original RAG research project | Reference |
 
 ### Technical Details
 

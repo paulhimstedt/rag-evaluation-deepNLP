@@ -46,7 +46,7 @@ def metric_max_over_ground_truths(metric_fn, prediction, ground_truths):
 
 
 def get_scores(args, preds_path, gold_data_path):
-    hypos = [line.strip() for line in open(preds_path, "r").readlines()]
+    hypos = [line.strip() for line in open(preds_path, "r", encoding="utf-8", errors="replace").readlines()]
     answers = []
 
     if len(hypos) == 0:
@@ -82,7 +82,7 @@ def get_scores(args, preds_path, gold_data_path):
 
 def get_precision_at_k(args, preds_path, gold_data_path):
     k = args.k
-    hypos = [line.strip() for line in open(preds_path, "r").readlines()]
+    hypos = [line.strip() for line in open(preds_path, "r", encoding="utf-8", errors="replace").readlines()]
     with open(gold_data_path, "r") as ref_file:
         references = [line.strip() for line in itertools.islice(ref_file, len(hypos))]
 
@@ -299,6 +299,11 @@ def get_args():
         help="Limit number of evaluation samples (0 means no limit).",
     )
     parser.add_argument(
+        "--skip_scores",
+        action="store_true",
+        help="Skip EM/F1 or retrieval scoring (useful when computing metrics externally).",
+    )
+    parser.add_argument(
         "--passages_dataset",
         default=None,
         type=str,
@@ -367,7 +372,8 @@ def main(args):
     for checkpoint in checkpoints:
         if os.path.exists(args.predictions_path) and (not args.recalculate):
             logger.info("Calculating metrics based on an existing predictions file: {}".format(args.predictions_path))
-            score_fn(args, args.predictions_path, args.gold_data_path)
+            if not args.skip_scores:
+                score_fn(args, args.predictions_path, args.gold_data_path)
             continue
 
         logger.info("***** Running evaluation for {} *****".format(checkpoint))
@@ -417,7 +423,8 @@ def main(args):
                 preds_file.write("\n".join(answers))
                 preds_file.flush()
 
-            score_fn(args, args.predictions_path, args.gold_data_path)
+            if not args.skip_scores:
+                score_fn(args, args.predictions_path, args.gold_data_path)
 
 
 if __name__ == "__main__":

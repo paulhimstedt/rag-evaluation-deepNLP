@@ -26,14 +26,17 @@ Optional overrides:
 - `K=10` (change fixed retrieved docs)
 - `SAMPLE_SIZES="50 100"`
 - `RESULTS_PREFIX=sample_size_sensitivity`
-- `EVAL_BATCH_SIZE_SMALL=8` (batch size for K<=10)
-- `NUM_BEAMS=2` (reduce beams to fit 16GB GPUs)
+- `LOCAL_RESULTS_DIR=./results_from_modal/sample_size_sensitivity`
+- `EVAL_BATCH_SIZE_SMALL=4` (batch size for K<=10)
+- `NUM_BEAMS=1` (reduce beams to fit 16GB GPUs)
+ - `--refresh` (remove matching Modal result JSONs before rerun)
 
 ## Reduced-Scope Note (GPU Memory)
 These runs are intentionally configured for **reduced scope** to avoid GPU OOM on 16GB cards:
-- Conservative batch sizes (defaults: K<=10 → 8, K<=30 → 6, K>30 → 4)
-- Reduced beam size (default `NUM_BEAMS=2`)
+- Conservative batch sizes (defaults: K<=10 → 4, K<=30 → 4, K>30 → 2)
+- Reduced beam size (default `NUM_BEAMS=1`)
 - Sample sizes capped at 50/100
+- Local comparison tables are skipped during `modal run` to avoid build errors from files changing while Modal uploads the code mount.
 
 For larger GPUs (A10G/L4), you can increase batch sizes via `EVAL_BATCH_SIZE_*`.
 
