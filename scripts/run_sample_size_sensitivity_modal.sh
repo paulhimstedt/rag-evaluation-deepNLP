@@ -7,9 +7,10 @@ set -euo pipefail
 #   K=10
 #   RESULTS_PREFIX="sample_size_sensitivity"
 
-SAMPLE_SIZES="${SAMPLE_SIZES:-"100 300 500"}"
+SAMPLE_SIZES="${SAMPLE_SIZES:-"50 100"}"
 K="${K:-10}"
 RESULTS_PREFIX="${RESULTS_PREFIX:-sample_size_sensitivity}"
+NUM_BEAMS="${NUM_BEAMS:-2}"
 
 select_eval_batch_size() {
   local k="$1"
@@ -25,6 +26,7 @@ select_eval_batch_size() {
 echo "SAMPLE_SIZES: ${SAMPLE_SIZES}"
 echo "K: ${K}"
 echo "RESULTS_PREFIX: ${RESULTS_PREFIX}"
+echo "NUM_BEAMS: ${NUM_BEAMS}"
 
 eval_bs="$(select_eval_batch_size "$K")"
 
@@ -35,6 +37,7 @@ for s in ${SAMPLE_SIZES}; do
     --n-docs "${K}" \
     --eval-batch-size "${eval_bs}" \
     --max-eval-samples "${s}" \
+    --num-beams "${NUM_BEAMS}" \
     --results-file "${RESULTS_PREFIX}_nq_k${K}_s${s}.json"
 
 done
@@ -46,6 +49,7 @@ for s in ${SAMPLE_SIZES}; do
     --n-docs "${K}" \
     --eval-batch-size "${eval_bs}" \
     --max-eval-samples "${s}" \
+    --num-beams "${NUM_BEAMS}" \
     --results-file "${RESULTS_PREFIX}_msmarco_k${K}_s${s}.json"
 
 done

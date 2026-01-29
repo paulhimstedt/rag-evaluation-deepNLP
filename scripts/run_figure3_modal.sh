@@ -14,12 +14,14 @@ NQ_SAMPLES="${NQ_SAMPLES:-500}"
 NQ_RETRIEVAL_SAMPLES="${NQ_RETRIEVAL_SAMPLES:-500}"
 MSMARCO_SAMPLES="${MSMARCO_SAMPLES:-500}"
 RESULTS_PREFIX="${RESULTS_PREFIX:-figure3}"
+NUM_BEAMS="${NUM_BEAMS:-2}"
 
 echo "N_DOCS_LIST: ${N_DOCS_LIST}"
 echo "NQ_SAMPLES: ${NQ_SAMPLES}"
 echo "NQ_RETRIEVAL_SAMPLES: ${NQ_RETRIEVAL_SAMPLES}"
 echo "MSMARCO_SAMPLES: ${MSMARCO_SAMPLES}"
 echo "RESULTS_PREFIX: ${RESULTS_PREFIX}"
+echo "NUM_BEAMS: ${NUM_BEAMS}"
 
 select_eval_batch_size() {
   local k="$1"
@@ -40,6 +42,7 @@ for k in ${N_DOCS_LIST}; do
     --n-docs "${k}" \
     --eval-batch-size "${eval_bs}" \
     --max-eval-samples "${NQ_SAMPLES}" \
+    --num-beams "${NUM_BEAMS}" \
     --results-file "${RESULTS_PREFIX}_nq_k${k}.json"
 done
 
@@ -52,6 +55,7 @@ for k in ${N_DOCS_LIST}; do
     --eval-mode retrieval \
     --eval-batch-size "${eval_bs}" \
     --max-eval-samples "${NQ_RETRIEVAL_SAMPLES}" \
+    --num-beams "${NUM_BEAMS}" \
     --results-file "${RESULTS_PREFIX}_nq_retrieval_k${k}.json"
 done
 
@@ -63,6 +67,7 @@ for k in ${N_DOCS_LIST}; do
     --n-docs "${k}" \
     --eval-batch-size "${eval_bs}" \
     --max-eval-samples "${MSMARCO_SAMPLES}" \
+    --num-beams "${NUM_BEAMS}" \
     --results-file "${RESULTS_PREFIX}_msmarco_k${k}.json"
 done
 

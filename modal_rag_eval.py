@@ -507,6 +507,7 @@ def run_evaluation(
     n_docs: int = 5,
     eval_batch_size: int = 8,
     max_eval_samples: int = 0,
+    num_beams: int = 0,
 ) -> Dict:
     """
     Run evaluation for one dataset-model combination.
@@ -516,6 +517,7 @@ def run_evaluation(
         model_type: Model type ('rag_sequence', 'rag_token', 'bart')
         eval_mode: Evaluation mode ('e2e' or 'retrieval')
         n_docs: Number of documents to retrieve
+        num_beams: Beam size override (0 means default from eval_rag.py)
 
     Returns:
         Dict with evaluation results
@@ -584,6 +586,8 @@ def run_evaluation(
         '--eval_batch_size', str(eval_batch_size),
         '--print_predictions',
     ]
+    if num_beams and num_beams > 0:
+        cmd.extend(['--num_beams', str(num_beams)])
     if eval_mode == "retrieval":
         cmd.extend(['--k', str(n_docs)])
     if max_eval_samples and max_eval_samples > 0:
@@ -987,6 +991,7 @@ def main(
     eval_batch_size: int = 8,
     eval_mode: str = "e2e",
     results_file: str = "evaluation_results.json",
+    num_beams: int = 0,
 ):
     """
     Main entrypoint for RAG evaluation on Modal.
@@ -1008,6 +1013,7 @@ def main(
         eval_batch_size: Batch size for evaluation
         eval_mode: Evaluation mode ("e2e" or "retrieval")
         results_file: Output filename for evaluation results JSON
+        num_beams: Beam size override (0 means default from eval_rag.py)
     """
     print("\n" + "=" * 80)
     print("RAG Paper Reproduction - Modal Evaluation")
@@ -1091,7 +1097,7 @@ def main(
 
         print(f"Evaluating on {len(datasets_to_eval)} datasets: {', '.join(datasets_to_eval)}")
         print(f"Models: {', '.join(models_to_eval)}")
-        print(f"n_docs={n_docs}, eval_batch_size={eval_batch_size}, eval_mode={eval_mode}")
+        print(f"n_docs={n_docs}, eval_batch_size={eval_batch_size}, eval_mode={eval_mode}, num_beams={num_beams or 'default'}")
 
     # Run all evaluations
     results = []
@@ -1110,6 +1116,7 @@ def main(
                 n_docs=n_docs,
                 eval_batch_size=eval_batch_size,
                 max_eval_samples=max_eval_samples,
+                num_beams=num_beams,
             )
 
             results.append(result)

@@ -108,6 +108,8 @@ def main():
     summary: Dict[str, Dict] = {}
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), constrained_layout=True)
+    if sample_sizes:
+        fig.suptitle(f"Sample sizes: {', '.join(str(s) for s in sample_sizes)}", fontsize=10)
 
     # NQ EM
     ax = axes[0]
@@ -143,11 +145,17 @@ def main():
     print(f"Saved figure to {args.output}")
 
     if args.summary_output:
+        payload = {
+            "sample_sizes": sample_sizes,
+            "metrics": summary,
+        }
         with open(args.summary_output, "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2)
+            json.dump(payload, f, indent=2)
         print(f"Saved summary to {args.summary_output}")
     else:
         print("Summary:")
+        if sample_sizes:
+            print(f"  sample_sizes: {sample_sizes}")
         for key, stats in summary.items():
             if not stats:
                 continue

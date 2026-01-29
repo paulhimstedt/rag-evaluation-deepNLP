@@ -18,20 +18,22 @@ The main Figure 3 sweep is expensive. This extension quantifies metric stability
 ## How to Run
 
 ```bash
-SAMPLE_SIZES="100 300 500" K=10 RESULTS_PREFIX=sample_size_sensitivity \
+SAMPLE_SIZES="50 100" K=10 RESULTS_PREFIX=sample_size_sensitivity \
   bash scripts/run_sample_size_sensitivity_modal.sh
 ```
 
 Optional overrides:
 - `K=10` (change fixed retrieved docs)
-- `SAMPLE_SIZES="100 300 500"`
+- `SAMPLE_SIZES="50 100"`
 - `RESULTS_PREFIX=sample_size_sensitivity`
 - `EVAL_BATCH_SIZE_SMALL=8` (batch size for K<=10)
+- `NUM_BEAMS=2` (reduce beams to fit 16GB GPUs)
 
 ## Reduced-Scope Note (GPU Memory)
 These runs are intentionally configured for **reduced scope** to avoid GPU OOM on 16GB cards:
 - Conservative batch sizes (defaults: K<=10 → 8, K<=30 → 6, K>30 → 4)
-- Sample sizes capped at 100/300/500
+- Reduced beam size (default `NUM_BEAMS=2`)
+- Sample sizes capped at 50/100
 
 For larger GPUs (A10G/L4), you can increase batch sizes via `EVAL_BATCH_SIZE_*`.
 
