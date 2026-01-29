@@ -180,6 +180,63 @@ def parse_csv_arg(value: str) -> List[str]:
     return [v.strip() for v in value.split(',') if v.strip()]
 
 
+def parse_int_csv(value: str) -> List[int]:
+    if not value:
+        return []
+    ints = []
+    for token in value.split(','):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            ints.append(int(token))
+        except ValueError:
+            raise ValueError(f"Invalid integer value: {token}")
+    return ints
+
+
+def ensure_preparer_on_path() -> bool:
+    """Ensure prepare_eval_datasets.py is importable by adding likely paths to sys.path."""
+    try:
+        from importlib import import_module
+        import_module("prepare_eval_datasets")
+        return True
+    except Exception:
+        pass
+
+    import sys
+    candidates = [
+        Path(CODE_DIR),
+        Path(CODE_DIR) / "rag-evaluation-deepNLP",
+        Path(__file__).resolve().parent,
+        Path(__file__).resolve().parent.parent,
+    ]
+    for path in candidates:
+        if (path / "prepare_eval_datasets.py").exists():
+            if str(path) not in sys.path:
+                sys.path.insert(0, str(path))
+            try:
+                from importlib import import_module
+                import_module("prepare_eval_datasets")
+                return True
+            except Exception:
+                continue
+    return False
+
+
+def resolve_eval_rag_path() -> str:
+    """Resolve eval_rag.py path inside the container."""
+    candidates = [
+        Path(CODE_DIR) / "eval_rag.py",
+        Path(CODE_DIR) / "rag-evaluation-deepNLP" / "eval_rag.py",
+        Path(__file__).resolve().parent / "eval_rag.py",
+    ]
+    for path in candidates:
+        if path.exists():
+            return str(path)
+    return str(candidates[0])
+
+
 def format_comparison_table(results: List[Dict]) -> str:
     """Format results as a comparison table with paper results."""
     lines = []
@@ -210,6 +267,33 @@ def format_comparison_table(results: List[Dict]) -> str:
         )
 
     lines.append("=" * 100)
+    return "\n".join(lines)
+
+
+def format_subset_size_table(results: List[Dict]) -> str:
+    """Format NQ subset-size evaluation results table."""
+    lines = []
+    lines.append("=" * 92)
+    lines.append("NQ Subset-Size Evaluation Results")
+    lines.append("=" * 92)
+    lines.append(f"{'Subset Size':<12} {'Model':<15} {'EM':<8} {'F1':<8} {'Status':<10}")
+    lines.append("-" * 92)
+
+    def sort_key(r):
+        return (r.get("max_eval_samples", 0), r.get("model", ""))
+
+    for result in sorted(results, key=sort_key):
+        subset_size = result.get("max_eval_samples", 0) or 0
+        model = result.get("model", "")
+        metrics = result.get("metrics", {})
+        em = metrics.get("em", 0.0)
+        f1 = metrics.get("f1", 0.0)
+        status = "ok" if result.get("status") == "success" else "error"
+        lines.append(
+            f"{subset_size:<12} {model:<15} {em:<8.2f} {f1:<8.2f} {status:<10}"
+        )
+
+    lines.append("=" * 92)
     return "\n".join(lines)
 
 
@@ -421,17 +505,17 @@ def prepare_datasets(max_samples: int = 0):
 
             if missing_optional:
                 print(f"\n📥 Preparing missing optional datasets: {', '.join(missing_optional)}")
-                import sys
-                if CODE_DIR not in sys.path:
-                    sys.path.insert(0, CODE_DIR)
-                from prepare_eval_datasets import DatasetPreparer
-                preparer = DatasetPreparer(output_dir=EVAL_DATASETS_DIR, max_samples=max_samples)
-                if "nq_retrieval" in missing_optional:
-                    try:
-                        results["nq_retrieval"] = preparer.prepare_nq_retrieval()
-                    except Exception as e:
-                        print(f"✗ NQ retrieval preparation failed: {e}")
-                        results["nq_retrieval"] = 0
+                if ensure_preparer_on_path():
+                    from prepare_eval_datasets import DatasetPreparer
+                    preparer = DatasetPreparer(output_dir=EVAL_DATASETS_DIR, max_samples=max_samples)
+                    if "nq_retrieval" in missing_optional:
+                        try:
+                            results["nq_retrieval"] = preparer.prepare_nq_retrieval()
+                        except Exception as e:
+                            print(f"✗ NQ retrieval preparation failed: {e}")
+                            results["nq_retrieval"] = 0
+                else:
+                    print("⚠ prepare_eval_datasets.py not found; skipping optional dataset preparation")
 
             results_file = f"{RESULTS_DIR}/dataset_preparation_results.json"
             os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -456,7 +540,10 @@ def prepare_datasets(max_samples: int = 0):
 
     # Add code directory to path
     import sys
-    sys.path.insert(0, CODE_DIR)
+    if CODE_DIR not in sys.path:
+        sys.path.insert(0, CODE_DIR)
+    if not ensure_preparer_on_path():
+        raise ModuleNotFoundError("prepare_eval_datasets.py not found on sys.path")
 
     # Capture detailed logs to file
     log_file = f"{RESULTS_DIR}/dataset_preparation.log"
@@ -574,8 +661,9 @@ def run_evaluation(
         recalculate = True
         print(f"⚠ Found empty predictions file, forcing recompute: {preds_path}")
 
+    eval_script_path = resolve_eval_rag_path()
     cmd = [
-        'python', f'{CODE_DIR}/eval_rag.py',
+        'python', eval_script_path,
         '--model_name_or_path', model_name,
         '--model_type', model_type,
         '--evaluation_set', source_path,
@@ -608,6 +696,8 @@ def run_evaluation(
         ])
 
     print(f"Running command: {' '.join(cmd)}")
+    if not os.path.exists(eval_script_path):
+        print(f"⚠ eval_rag.py not found at {eval_script_path}")
 
     try:
         # Run evaluation with streaming output
@@ -871,8 +961,9 @@ def run_table3_eval(
     preds_path = f"{RESULTS_DIR}/{dataset_name}_{model_type}_k{n_docs}_preds.txt"
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
+    eval_script_path = resolve_eval_rag_path()
     cmd = [
-        'python', f'{CODE_DIR}/eval_rag.py',
+        'python', eval_script_path,
         '--model_name_or_path', model_name,
         '--model_type', model_type,
         '--evaluation_set', source_path,
@@ -894,6 +985,8 @@ def run_table3_eval(
         ])
 
     print(f"Running command: {' '.join(cmd)}")
+    if not os.path.exists(eval_script_path):
+        print(f"⚠ eval_rag.py not found at {eval_script_path}")
 
     try:
         process = subprocess.Popen(
@@ -1270,6 +1363,113 @@ def table3_examples(
     save_results.remote(results, results_file)
     print(f"\n✓ Table 3 results saved to: {RESULTS_DIR}/{results_file}")
     print(f"  Subset metadata: {subset_info.get('meta_path')}")
+
+    return results
+
+
+# ============================================================================
+# NQ Subset-Size Experiment Entry Point
+# ============================================================================
+
+
+@app.local_entrypoint()
+def nq_subset_experiment(
+    subset_sizes: str = "50,100,500,1000,3610",
+    models: str = "rag_sequence,rag_token",
+    n_docs: int = 5,
+    eval_batch_size: int = 8,
+    eval_mode: str = "e2e",
+    num_beams: int = 0,
+    results_file: str = "nq_subset_results.json",
+    skip_setup: bool = False,
+    skip_local_results: bool = False,
+):
+    """
+    Evaluate NQ on progressively larger subsets to measure quality vs. size.
+
+    Args:
+        subset_sizes: Comma-separated subset sizes (e.g., "50,100,500,1000,3610")
+        models: Comma-separated model list (default rag_sequence,rag_token)
+        n_docs: Number of documents to retrieve per query
+        eval_batch_size: Batch size for evaluation
+        eval_mode: Evaluation mode ("e2e" or "retrieval")
+        num_beams: Beam size override (0 means default from eval_rag.py)
+        results_file: Output filename for results JSON
+        skip_setup: Skip wiki_dpr setup steps (use if cache already exists)
+        skip_local_results: Skip writing local results files
+    """
+    print("\n" + "=" * 80)
+    print("NQ Subset-Size Experiment (Open-Domain QA)")
+    print("=" * 80 + "\n")
+
+    sizes = parse_int_csv(subset_sizes)
+    if not sizes:
+        print("âœ— No subset sizes provided.")
+        return []
+
+    model_list = parse_csv_arg(models)
+    if not model_list:
+        print("âœ— No models provided.")
+        return []
+
+    if eval_mode not in ["e2e", "retrieval"]:
+        print(f"âœ— Invalid eval_mode: {eval_mode} (expected 'e2e' or 'retrieval')")
+        return []
+
+    if not skip_setup:
+        print("[1/3] Setting up wiki_dpr index...")
+        setup_wiki_index.remote()
+        print("[2/3] Preparing evaluation datasets...")
+        prepare_datasets.remote()
+        print("[3/3] Setting up wiki_dpr passages...")
+        setup_wiki_passages.remote()
+    else:
+        print("Skipping setup as requested.")
+
+    results = []
+    total = len(sizes) * len(model_list)
+    current = 0
+
+    for size in sizes:
+        for model in model_list:
+            current += 1
+            print(f"\n[{current}/{total}] Evaluating {model} on NQ subset size {size}...")
+            result = run_evaluation.remote(
+                dataset_name="nq",
+                model_type=model,
+                eval_mode=eval_mode,
+                n_docs=n_docs,
+                eval_batch_size=eval_batch_size,
+                max_eval_samples=size,
+                num_beams=num_beams,
+            )
+            results.append(result)
+
+            if result.get("status") == "success":
+                metrics = result.get("metrics", {})
+                print(f"  âœ“ EM: {metrics.get('em', 0):.2f}, F1: {metrics.get('f1', 0):.2f}")
+            else:
+                print(f"  âœ— Error: {result.get('error', 'Unknown error')}")
+
+    print("\nGenerating results...")
+    save_results.remote(results, results_file)
+
+    table = format_subset_size_table(results)
+    print("\n" + table)
+
+    if not skip_local_results:
+        local_results_dir = Path("./results")
+        local_results_dir.mkdir(parents=True, exist_ok=True)
+        comparison_name = Path(results_file).name.replace(".json", "")
+        table_path = local_results_dir / f"comparison_table_{comparison_name}.txt"
+        with open(table_path, 'w') as f:
+            f.write(table)
+        print(f"\nâœ“ Subset table saved to: {table_path}")
+    else:
+        print("\nSubset table saved to: (skipped local write)")
+
+    successful = sum(1 for r in results if r.get("status") == "success")
+    print(f"\n  Success rate: {successful}/{len(results)} ({100*successful/len(results):.1f}%)")
 
     return results
 
