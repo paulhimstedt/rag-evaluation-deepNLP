@@ -17,7 +17,7 @@ import os
 import re
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import modal
 
@@ -47,6 +47,8 @@ image = (
         "psutil>=5.8.0",
         "GitPython>=3.1.0",
         "kaggle>=1.5.12",  # For automatic MS-MARCO download
+        "sacrebleu>=2.3.0,<3.0.0",  # BLEU-1 for MS-MARCO plotting
+        "rouge-score>=0.1.2,<0.2.0",  # ROUGE-L for MS-MARCO plotting
         # Note: pytorch-lightning not needed for evaluation, only for training
     )
     # Add local Python files to the image
@@ -75,12 +77,25 @@ CODE_DIR = "/workspace"
 
 # Dataset names
 DATASETS = ['nq', 'triviaqa', 'webquestions', 'curatedtrec', 'msmarco', 'searchqa', 'fever_3way']
+# Optional datasets (prepared but not included in default full runs)
+OPTIONAL_DATASETS = ['nq_retrieval']
 
 # Model configurations
 MODELS = {
     'rag_sequence': 'facebook/rag-sequence-nq',
     'rag_token': 'facebook/rag-token-nq',
     'bart': 'facebook/bart-large',
+}
+
+TABLE3_EXAMPLES = {
+    "msmarco": [
+        "define middle ear",
+        "what currency needed in scotland",
+    ],
+    "jeopardy_qg": [
+        "Washington",
+        "The Divine Comedy",
+    ],
 }
 
 # Paper results for comparison (Table 1 from RAG paper)
@@ -119,6 +134,14 @@ def parse_metrics_from_output(output: str) -> Dict[str, float]:
         r'"em":\s*([\d.]+)',
         r'exact_match:\s+([\d.]+)',
     ]
+    precision_patterns = [
+        r'Precision@(\d+):\s*([\d.]+)',
+        r'precision@(\d+):\s*([\d.]+)',
+    ]
+    recall_patterns = [
+        r'Recall@(\d+):\s*([\d.]+)',
+        r'recall@(\d+):\s*([\d.]+)',
+    ]
 
     # Try each pattern
     for pattern in f1_patterns:
@@ -131,6 +154,21 @@ def parse_metrics_from_output(output: str) -> Dict[str, float]:
         em_match = re.search(pattern, output, re.IGNORECASE)
         if em_match:
             metrics['em'] = float(em_match.group(1))
+            break
+
+    for pattern in precision_patterns:
+        precision_match = re.search(pattern, output, re.IGNORECASE)
+        if precision_match:
+            metrics['precision_at_k'] = float(precision_match.group(2))
+            metrics['k'] = int(precision_match.group(1))
+            break
+
+    for pattern in recall_patterns:
+        recall_match = re.search(pattern, output, re.IGNORECASE)
+        if recall_match:
+            metrics['recall_at_k'] = float(recall_match.group(2))
+            if 'k' not in metrics:
+                metrics['k'] = int(recall_match.group(1))
             break
 
     return metrics
@@ -373,6 +411,28 @@ def prepare_datasets(max_samples: int = 0):
                 with open(source_path, 'r') as fh:
                     results[dataset_name] = sum(1 for _ in fh)
 
+            # Generate optional datasets if missing (e.g., nq_retrieval)
+            missing_optional = []
+            for ds in OPTIONAL_DATASETS:
+                src = os.path.join(EVAL_DATASETS_DIR, f"{ds}_test.source")
+                tgt = os.path.join(EVAL_DATASETS_DIR, f"{ds}_test.target")
+                if not (os.path.exists(src) and os.path.exists(tgt)):
+                    missing_optional.append(ds)
+
+            if missing_optional:
+                print(f"\n📥 Preparing missing optional datasets: {', '.join(missing_optional)}")
+                import sys
+                if CODE_DIR not in sys.path:
+                    sys.path.insert(0, CODE_DIR)
+                from prepare_eval_datasets import DatasetPreparer
+                preparer = DatasetPreparer(output_dir=EVAL_DATASETS_DIR, max_samples=max_samples)
+                if "nq_retrieval" in missing_optional:
+                    try:
+                        results["nq_retrieval"] = preparer.prepare_nq_retrieval()
+                    except Exception as e:
+                        print(f"✗ NQ retrieval preparation failed: {e}")
+                        results["nq_retrieval"] = 0
+
             results_file = f"{RESULTS_DIR}/dataset_preparation_results.json"
             os.makedirs(RESULTS_DIR, exist_ok=True)
             with open(results_file, 'w') as f:
@@ -381,7 +441,7 @@ def prepare_datasets(max_samples: int = 0):
                     "datasets": results,
                     "note": "Datasets were uploaded via upload_datasets_to_modal.sh"
                 }, f, indent=2)
-            
+
             volume.commit()
             return results
     
@@ -446,6 +506,7 @@ def run_evaluation(
     eval_mode: str = "e2e",
     n_docs: int = 5,
     eval_batch_size: int = 8,
+    max_eval_samples: int = 0,
 ) -> Dict:
     """
     Run evaluation for one dataset-model combination.
@@ -482,7 +543,7 @@ def run_evaluation(
     # Construct paths
     source_path = f"{EVAL_DATASETS_DIR}/{dataset_name}_test.source"
     target_path = f"{EVAL_DATASETS_DIR}/{dataset_name}_test.target"
-    preds_path = f"{RESULTS_DIR}/{dataset_name}_{model_type}_preds.txt"
+    preds_path = f"{RESULTS_DIR}/{dataset_name}_{model_type}_k{n_docs}_preds.txt"
 
     # Create results directory
     os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -523,6 +584,10 @@ def run_evaluation(
         '--eval_batch_size', str(eval_batch_size),
         '--print_predictions',
     ]
+    if eval_mode == "retrieval":
+        cmd.extend(['--k', str(n_docs)])
+    if max_eval_samples and max_eval_samples > 0:
+        cmd.extend(['--max_eval_samples', str(max_eval_samples)])
     if recalculate:
         cmd.append('--recalculate')
 
@@ -568,6 +633,25 @@ def run_evaluation(
         # Parse metrics from output
         metrics = parse_metrics_from_output(stdout_text)
 
+        # Optional generation metrics for MS-MARCO (BLEU-1, ROUGE-L)
+        if dataset_name == "msmarco" and eval_mode == "e2e":
+            gen_metrics_path = f"{RESULTS_DIR}/{dataset_name}_{model_type}_k{n_docs}_gen_metrics.json"
+            gen_cmd = [
+                'python', f'{CODE_DIR}/scripts/eval_gen_metrics.py',
+                '--predictions_path', preds_path,
+                '--gold_data_path', target_path,
+                '--gold_data_mode', 'qa',
+                '--output_json', gen_metrics_path,
+            ]
+            try:
+                subprocess.run(gen_cmd, check=True, cwd=CODE_DIR, env=os.environ.copy())
+                if os.path.exists(gen_metrics_path):
+                    with open(gen_metrics_path, 'r') as f:
+                        gen_metrics = json.load(f)
+                    metrics.update(gen_metrics)
+            except Exception as e:
+                print(f"⚠ Generation metrics failed: {e}")
+
         # Debug: Print warning if metrics are empty
         if not metrics:
             print(f"\n⚠ Warning: No metrics found in output")
@@ -580,8 +664,12 @@ def run_evaluation(
             with open(source_path, 'r') as f:
                 num_samples = sum(1 for _ in f)
 
+        effective_samples = num_samples
+        if max_eval_samples and max_eval_samples > 0:
+            effective_samples = min(num_samples, max_eval_samples)
+
         print(f"✓ Evaluation complete")
-        print(f"  Samples: {num_samples}")
+        print(f"  Samples: {effective_samples}")
         print(f"  Metrics: {metrics}")
 
         # Commit results to volume
@@ -592,7 +680,8 @@ def run_evaluation(
             'model': model_type,
             'eval_mode': eval_mode,
             'n_docs': n_docs,
-            'num_samples': num_samples,
+            'num_samples': effective_samples,
+            'max_eval_samples': max_eval_samples,
             'metrics': metrics,
             'status': 'success',
             'stdout': stdout_text[-2000:],  # Last 2000 chars
@@ -606,6 +695,258 @@ def run_evaluation(
             'model': model_type,
             'status': 'error',
             'error': str(e),
+        }
+
+
+@app.function(
+    image=image,
+    volumes={VOLUME_PATH: volume},
+    timeout=600,
+    cpu=1.0,
+    memory=4096,
+)
+def prepare_table3_subsets():
+    """Create minimal Table 3 datasets on the Modal volume."""
+    def build_subset(dataset_name: str, questions: List[str]) -> Dict:
+        source_path = Path(EVAL_DATASETS_DIR) / f"{dataset_name}_test.source"
+        target_path = Path(EVAL_DATASETS_DIR) / f"{dataset_name}_test.target"
+        if not source_path.exists() or not target_path.exists():
+            return {
+                "status": "error",
+                "error": f"Missing dataset files for {dataset_name}",
+                "source_path": str(source_path),
+                "target_path": str(target_path),
+            }
+
+        question_set = set(questions)
+        indices = {}
+        duplicates = {}
+        with open(source_path, "r") as f_src:
+            for idx, line in enumerate(f_src):
+                text = line.strip()
+                if text in question_set:
+                    duplicates[text] = duplicates.get(text, 0) + 1
+                    if text not in indices:
+                        indices[text] = idx
+
+        missing = [q for q in questions if q not in indices]
+        if missing:
+            return {
+                "status": "error",
+                "error": f"Missing questions in {dataset_name}: {missing}",
+                "source_path": str(source_path),
+                "target_path": str(target_path),
+            }
+
+        wanted_indices = set(indices.values())
+        target_lines = {}
+        with open(target_path, "r") as f_tgt:
+            for idx, line in enumerate(f_tgt):
+                if idx in wanted_indices:
+                    target_lines[idx] = line.strip()
+                    if len(target_lines) == len(wanted_indices):
+                        break
+
+        subset_name = f"{dataset_name}_table3"
+        subset_source = Path(EVAL_DATASETS_DIR) / f"{subset_name}_test.source"
+        subset_target = Path(EVAL_DATASETS_DIR) / f"{subset_name}_test.target"
+
+        with open(subset_source, "w") as f_src, open(subset_target, "w") as f_tgt:
+            for q in questions:
+                idx = indices[q]
+                f_src.write(q + "\n")
+                target_line = target_lines.get(idx)
+                if not target_line:
+                    target_line = f"{q}\t['']"
+                f_tgt.write(target_line + "\n")
+
+        dupes = {k: v for k, v in duplicates.items() if v > 1}
+        return {
+            "status": "ok",
+            "dataset_name": subset_name,
+            "source_path": str(subset_source),
+            "target_path": str(subset_target),
+            "gold_data_mode": "qa",
+            "inputs": questions,
+            "duplicates": dupes,
+        }
+
+    results = {}
+    errors = []
+
+    msmarco_result = build_subset("msmarco", TABLE3_EXAMPLES["msmarco"])
+    results["msmarco"] = msmarco_result
+    if msmarco_result.get("status") != "ok":
+        errors.append(msmarco_result.get("error", "Unknown MSMARCO error"))
+
+    # Jeopardy question generation examples (input is the answer)
+    jeopardy_inputs = TABLE3_EXAMPLES["jeopardy_qg"]
+    jeopardy_name = "jeopardy_qg_table3"
+    jeopardy_source = Path(EVAL_DATASETS_DIR) / f"{jeopardy_name}_test.source"
+    jeopardy_target = Path(EVAL_DATASETS_DIR) / f"{jeopardy_name}_test.target"
+
+    with open(jeopardy_source, "w") as f_src, open(jeopardy_target, "w") as f_tgt:
+        for text in jeopardy_inputs:
+            f_src.write(text + "\n")
+            f_tgt.write("N/A\n")
+
+    results["jeopardy_qg"] = {
+        "status": "ok",
+        "dataset_name": jeopardy_name,
+        "source_path": str(jeopardy_source),
+        "target_path": str(jeopardy_target),
+        "gold_data_mode": "ans",
+        "inputs": jeopardy_inputs,
+        "note": "Placeholder references (metrics are not meaningful).",
+    }
+
+    meta_path = Path(RESULTS_DIR) / "table3_subset_meta.json"
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    with open(meta_path, "w") as f_meta:
+        json.dump({"datasets": results, "errors": errors}, f_meta, indent=2)
+
+    volume.commit()
+
+    status = "ok" if not errors else "error"
+    return {"status": status, "errors": errors, "datasets": results, "meta_path": str(meta_path)}
+
+
+@app.function(
+    image=image,
+    gpu="T4",
+    volumes={VOLUME_PATH: volume},
+    timeout=43200,
+    cpu=4.0,
+    memory=16384,
+)
+def run_table3_eval(
+    dataset_key: str,
+    dataset_name: str,
+    source_path: str,
+    target_path: str,
+    gold_data_mode: str,
+    model_type: str,
+    n_docs: int = 5,
+    eval_batch_size: int = 4,
+    recalculate: bool = True,
+) -> Dict:
+    """Run evaluation on Table 3 subset and return predictions."""
+    print("=" * 80)
+    print(f"Table 3 eval: {model_type} on {dataset_key}")
+    print("=" * 80)
+
+    # Set HuggingFace cache to volume
+    os.environ['HF_HOME'] = HF_CACHE_DIR
+    os.environ['HF_DATASETS_CACHE'] = f"{HF_CACHE_DIR}/datasets"
+    os.environ['TRANSFORMERS_CACHE'] = f"{HF_CACHE_DIR}/transformers"
+    os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = "1"
+    os.environ['HF_XET_HIGH_PERFORMANCE'] = "1"
+
+    # Add CODE_DIR to PYTHONPATH for imports
+    os.environ['PYTHONPATH'] = CODE_DIR + ':' + os.environ.get('PYTHONPATH', '')
+
+    if not os.path.exists(source_path):
+        return {
+            "dataset": dataset_key,
+            "model": model_type,
+            "status": "error",
+            "error": f"Source file not found: {source_path}",
+        }
+    if not os.path.exists(target_path):
+        return {
+            "dataset": dataset_key,
+            "model": model_type,
+            "status": "error",
+            "error": f"Target file not found: {target_path}",
+        }
+
+    model_name = MODELS[model_type]
+    preds_path = f"{RESULTS_DIR}/{dataset_name}_{model_type}_k{n_docs}_preds.txt"
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+
+    cmd = [
+        'python', f'{CODE_DIR}/eval_rag.py',
+        '--model_name_or_path', model_name,
+        '--model_type', model_type,
+        '--evaluation_set', source_path,
+        '--gold_data_path', target_path,
+        '--gold_data_mode', gold_data_mode,
+        '--predictions_path', preds_path,
+        '--eval_mode', 'e2e',
+        '--n_docs', str(n_docs),
+        '--eval_batch_size', str(eval_batch_size),
+        '--print_predictions',
+    ]
+    if recalculate:
+        cmd.append('--recalculate')
+    if model_type in ['rag_sequence', 'rag_token']:
+        cmd.extend(['--index_name', 'compressed'])
+        cmd.extend([
+            '--passages_dataset', 'facebook/wiki_dpr',
+            '--passages_config', 'psgs_w100.nq.compressed',
+        ])
+
+    print(f"Running command: {' '.join(cmd)}")
+
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            cwd=CODE_DIR,
+            env=os.environ.copy(),
+            bufsize=1,
+            universal_newlines=True,
+        )
+
+        stdout_lines = []
+        print("\n" + "=" * 80)
+        print("Evaluation Output:")
+        print("=" * 80)
+        for line in process.stdout:
+            print(line, end="")
+            stdout_lines.append(line)
+
+        return_code = process.wait()
+        stdout_text = ''.join(stdout_lines)
+        print("=" * 80 + "\n")
+
+        metrics = parse_metrics_from_output(stdout_text)
+
+        inputs = []
+        predictions = []
+        if os.path.exists(source_path):
+            with open(source_path, "r") as f_src:
+                inputs = [line.rstrip("\n") for line in f_src]
+        if os.path.exists(preds_path):
+            with open(preds_path, "r") as f_pred:
+                predictions = [line.rstrip("\n") for line in f_pred]
+
+        volume.commit()
+
+        return {
+            "dataset": dataset_key,
+            "dataset_name": dataset_name,
+            "model": model_type,
+            "gold_data_mode": gold_data_mode,
+            "n_docs": n_docs,
+            "eval_batch_size": eval_batch_size,
+            "metrics": metrics,
+            "inputs": inputs,
+            "predictions": predictions,
+            "status": "success",
+            "stdout": stdout_text[-2000:],
+            "return_code": return_code,
+        }
+    except Exception as e:
+        print(f"✗ Table 3 eval failed: {e}")
+        return {
+            "dataset": dataset_key,
+            "dataset_name": dataset_name,
+            "model": model_type,
+            "status": "error",
+            "error": str(e),
         }
 
 
@@ -639,6 +980,7 @@ def main(
     datasets_only: bool = False,
     test_mode: bool = False,
     max_samples: int = 0,
+    max_eval_samples: int = 0,
     datasets: str = "",
     models: str = "",
     n_docs: int = 5,
@@ -659,6 +1001,7 @@ def main(
                    - Estimating time/cost before committing to the full run
                    Expected time: ~2 hours, Cost: ~$3-5
         max_samples: Max samples per dataset (0 means no limit)
+        max_eval_samples: Limit number of evaluation samples per dataset (0 means no limit)
         datasets: Comma-separated list of datasets to evaluate (e.g., "nq,triviaqa")
         models: Comma-separated list of models to evaluate (rag_sequence, rag_token, bart)
         n_docs: Number of documents to retrieve per query
@@ -718,12 +1061,13 @@ def main(
             return []
 
         base_datasets = [d for d in DATASETS if d in available_datasets]
+        optional_datasets = [d for d in OPTIONAL_DATASETS if d in available_datasets]
         if datasets:
             requested = parse_csv_arg(datasets)
-            invalid = [d for d in requested if d not in base_datasets]
+            invalid = [d for d in requested if d not in base_datasets and d not in optional_datasets]
             if invalid:
                 print(f"⚠ Ignoring unknown/unavailable datasets: {', '.join(invalid)}")
-            datasets_to_eval = [d for d in requested if d in base_datasets]
+            datasets_to_eval = [d for d in requested if d in base_datasets or d in optional_datasets]
         else:
             datasets_to_eval = base_datasets
 
@@ -765,6 +1109,7 @@ def main(
                 eval_mode=eval_mode,
                 n_docs=n_docs,
                 eval_batch_size=eval_batch_size,
+                max_eval_samples=max_eval_samples,
             )
 
             results.append(result)
@@ -772,7 +1117,13 @@ def main(
             # Print immediate feedback
             if result['status'] == 'success':
                 metrics = result['metrics']
-                print(f"  ✓ EM: {metrics.get('em', 0):.2f}, F1: {metrics.get('f1', 0):.2f}")
+                if result.get('eval_mode') == 'retrieval':
+                    print(
+                        f"  ✓ Precision@K: {metrics.get('precision_at_k', 0):.2f}, "
+                        f"Recall@K: {metrics.get('recall_at_k', 0):.2f}"
+                    )
+                else:
+                    print(f"  ✓ EM: {metrics.get('em', 0):.2f}, F1: {metrics.get('f1', 0):.2f}")
             else:
                 print(f"  ✗ Error: {result.get('error', 'Unknown error')}")
 
@@ -801,6 +1152,102 @@ def main(
     # Calculate success rate
     successful = sum(1 for r in results if r['status'] == 'success')
     print(f"\n  Success rate: {successful}/{len(results)} ({100*successful/len(results):.1f}%)")
+
+    return results
+
+
+# ============================================================================
+# Table 3 Reproduction Entry Point
+# ============================================================================
+
+
+@app.local_entrypoint()
+def table3_examples(
+    skip_setup: bool = False,
+    n_docs: int = 5,
+    eval_batch_size: int = 4,
+    recalculate: bool = True,
+    results_file: str = "table3_examples.json",
+):
+    """
+    Reproduce Table 3 example generations on Modal.
+
+    Args:
+        skip_setup: Skip wiki_dpr setup (use only if cache is already available).
+        n_docs: Number of documents to retrieve per query.
+        eval_batch_size: Batch size for evaluation.
+        recalculate: Force regeneration even if predictions exist.
+        results_file: Output filename for Table 3 results JSON.
+    """
+    print("\n" + "=" * 80)
+    print("RAG Paper Reproduction - Table 3 Examples")
+    print("=" * 80 + "\n")
+
+    if not skip_setup:
+        print("[1/3] Setting up wiki_dpr index...")
+        setup_wiki_index.remote()
+        print("[2/3] Setting up wiki_dpr passages...")
+        setup_wiki_passages.remote()
+    else:
+        print("Skipping wiki_dpr setup as requested.")
+
+    print("[3/3] Preparing Table 3 subset datasets...")
+    subset_info = prepare_table3_subsets.remote()
+    if subset_info.get("status") != "ok":
+        print("✗ Failed to prepare Table 3 subsets:")
+        for err in subset_info.get("errors", []):
+            print(f"  - {err}")
+        return []
+
+    datasets = subset_info.get("datasets", {})
+    models = ["bart", "rag_token", "rag_sequence"]
+    model_labels = {"bart": "BART", "rag_token": "RAG-T", "rag_sequence": "RAG-S"}
+
+    results = []
+    for dataset_key in ["msmarco", "jeopardy_qg"]:
+        ds = datasets.get(dataset_key)
+        if not ds or ds.get("status") != "ok":
+            print(f"⚠ Skipping {dataset_key}: dataset not ready")
+            continue
+
+        for model in models:
+            result = run_table3_eval.remote(
+                dataset_key=dataset_key,
+                dataset_name=ds["dataset_name"],
+                source_path=ds["source_path"],
+                target_path=ds["target_path"],
+                gold_data_mode=ds["gold_data_mode"],
+                model_type=model,
+                n_docs=n_docs,
+                eval_batch_size=eval_batch_size,
+                recalculate=recalculate,
+            )
+            results.append(result)
+
+    # Print compact summary table
+    print("\n" + "=" * 80)
+    print("Table 3 Example Generations")
+    print("=" * 80)
+
+    pred_map = {(r.get("dataset"), r.get("model")): r.get("predictions", []) for r in results}
+    for dataset_key in ["msmarco", "jeopardy_qg"]:
+        ds = datasets.get(dataset_key, {})
+        inputs = ds.get("inputs", [])
+        if not inputs:
+            continue
+        print(f"\nTask: {dataset_key}")
+        if dataset_key == "jeopardy_qg":
+            print("Note: Metrics are not meaningful for question generation examples.")
+        for idx, text in enumerate(inputs):
+            print(f"Input: {text}")
+            for model in models:
+                preds = pred_map.get((dataset_key, model), [])
+                generation = preds[idx] if idx < len(preds) else "<missing>"
+                print(f"  {model_labels[model]}: {generation}")
+
+    save_results.remote(results, results_file)
+    print(f"\n✓ Table 3 results saved to: {RESULTS_DIR}/{results_file}")
+    print(f"  Subset metadata: {subset_info.get('meta_path')}")
 
     return results
 
@@ -1010,4 +1457,10 @@ modal run modal_rag_eval.py::cache_status
 
 # Aggregate results from multiple runs:
 modal run modal_rag_eval.py::aggregate_results
+
+# Reproduce Table 3 example generations:
+modal run modal_rag_eval.py::table3_examples
+
+# Reproduce Table 3 (skip wiki_dpr setup):
+modal run modal_rag_eval.py::table3_examples --skip-setup
 """

@@ -147,6 +147,53 @@ class DatasetPreparer:
         print(f"NQ: {num_dev} dev samples, {num_test} test samples")
         return num_test
 
+    def prepare_nq_retrieval(self):
+        """Prepare NQ retrieval dataset with gold passage titles from DPR."""
+        print("\n=== Preparing NQ Retrieval (DPR gold) ===")
+
+        source_path = self.output_dir / "nq_retrieval_test.source"
+        target_path = self.output_dir / "nq_retrieval_test.target"
+        if source_path.exists() and target_path.exists():
+            print("  Files already exist, skipping generation")
+            try:
+                with open(source_path, 'r') as f:
+                    count = sum(1 for _ in f)
+                print(f"  Using existing {source_path} ({count} samples)")
+                return count
+            except Exception:
+                print("  Existing files unreadable, regenerating...")
+
+        url = "https://dl.fbaipublicfiles.com/dpr/data/retriever/biencoder-nq-dev.json.gz"
+        gz_path = self.output_dir / "biencoder-nq-dev.json.gz"
+        json_path = self.download_file(url, gz_path, decompress_gz=True)
+        if not json_path:
+            print("  ✗ Failed to download biencoder-nq-dev.json.gz")
+            return 0
+
+        with open(json_path, "r", encoding="utf-8") as f:
+            dpr_records = json.load(f)
+
+        count = 0
+        with open(source_path, "w", encoding="utf-8") as f_src, open(target_path, "w", encoding="utf-8") as f_tgt:
+            for record in dpr_records:
+                if self._limit_reached(count):
+                    break
+                question = str(record.get("question", "")).strip()
+                positive_ctxs = record.get("positive_ctxs", [])
+                titles = []
+                for ctx in positive_ctxs:
+                    title = str(ctx.get("title", "")).strip()
+                    if title:
+                        titles.append(title)
+                if question and titles:
+                    f_src.write(question + "\n")
+                    f_tgt.write("\t".join(titles) + "\n")
+                    count += 1
+
+        print(f"  Created {source_path} ({count} samples)")
+        print(f"  Created {target_path}")
+        return count
+
     def prepare_triviaqa(self):
         """Prepare TriviaQA dataset from DPR."""
         print("\n=== Preparing TriviaQA ===")
@@ -795,6 +842,12 @@ class DatasetPreparer:
         except Exception as e:
             print(f"✗ NQ preparation failed: {e}")
             results['nq'] = 0
+
+        try:
+            results['nq_retrieval'] = self.prepare_nq_retrieval()
+        except Exception as e:
+            print(f"✗ NQ retrieval preparation failed: {e}")
+            results['nq_retrieval'] = 0
 
         try:
             results['triviaqa'] = self.prepare_triviaqa()

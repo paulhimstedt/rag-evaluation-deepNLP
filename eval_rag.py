@@ -6,11 +6,18 @@ import logging
 import os
 import sys
 
+import itertools
 import pandas as pd
 import torch
 from tqdm import tqdm
 
-from transformers import BartForConditionalGeneration, RagRetriever, RagSequenceForGeneration, RagTokenForGeneration
+from transformers import (
+    AutoTokenizer,
+    BartForConditionalGeneration,
+    RagRetriever,
+    RagSequenceForGeneration,
+    RagTokenForGeneration,
+)
 from transformers import logging as transformers_logging
 
 
@@ -42,13 +49,18 @@ def get_scores(args, preds_path, gold_data_path):
     hypos = [line.strip() for line in open(preds_path, "r").readlines()]
     answers = []
 
+    if len(hypos) == 0:
+        logger.warning("No predictions found in %s; skipping metrics.", preds_path)
+        return
+
     if args.gold_data_mode == "qa":
-        data = pd.read_csv(gold_data_path, sep="\t", header=None)
+        data = pd.read_csv(gold_data_path, sep="\t", header=None, nrows=len(hypos))
         for answer_list in data[1]:
             ground_truths = ast.literal_eval(answer_list)
             answers.append(ground_truths)
     else:
-        references = [line.strip() for line in open(gold_data_path, "r").readlines()]
+        with open(gold_data_path, "r") as ref_file:
+            references = [line.strip() for line in itertools.islice(ref_file, len(hypos))]
         answers = [[reference] for reference in references]
 
     f1 = em = total = 0
@@ -71,17 +83,24 @@ def get_scores(args, preds_path, gold_data_path):
 def get_precision_at_k(args, preds_path, gold_data_path):
     k = args.k
     hypos = [line.strip() for line in open(preds_path, "r").readlines()]
-    references = [line.strip() for line in open(gold_data_path, "r").readlines()]
+    with open(gold_data_path, "r") as ref_file:
+        references = [line.strip() for line in itertools.islice(ref_file, len(hypos))]
 
-    em = total = 0
+    precision_sum = 0
+    recall_sum = 0
+    total = 0
     for hypo, reference in zip(hypos, references):
         hypo_provenance = set(hypo.split("\t")[:k])
         ref_provenance = set(reference.split("\t"))
         total += 1
-        em += len(hypo_provenance & ref_provenance) / k
+        overlap = len(hypo_provenance & ref_provenance)
+        precision_sum += overlap / k if k else 0
+        recall_sum += overlap / len(ref_provenance) if ref_provenance else 0
 
-    em = 100.0 * em / total
-    logger.info(f"Precision@{k}: {em: .2f}")
+    precision = 100.0 * precision_sum / total if total else 0.0
+    recall = 100.0 * recall_sum / total if total else 0.0
+    logger.info(f"Precision@{k}: {precision: .2f}")
+    logger.info(f"Recall@{k}: {recall: .2f}")
 
 
 def evaluate_batch_retrieval(args, rag_model, questions):
@@ -117,25 +136,45 @@ def evaluate_batch_retrieval(args, rag_model, questions):
     return provenance_strings
 
 
-def evaluate_batch_e2e(args, rag_model, questions):
+def evaluate_batch_e2e(args, model, questions, tokenizer=None):
     with torch.no_grad():
-        inputs_dict = rag_model.retriever.question_encoder_tokenizer.batch_encode_plus(
-            questions, return_tensors="pt", padding=True, truncation=True
-        )
+        if hasattr(model, "retriever"):
+            inputs_dict = model.retriever.question_encoder_tokenizer.batch_encode_plus(
+                questions, return_tensors="pt", padding=True, truncation=True
+            )
 
-        input_ids = inputs_dict.input_ids.to(args.device)
-        attention_mask = inputs_dict.attention_mask.to(args.device)
-        outputs = rag_model.generate(  # rag_model overwrites generate
-            input_ids,
-            attention_mask=attention_mask,
-            num_beams=args.num_beams,
-            min_length=args.min_length,
-            max_length=args.max_length,
-            early_stopping=False,
-            num_return_sequences=1,
-            bad_words_ids=[[0, 0]],  # BART likes to repeat BOS tokens, dont allow it to generate more than one
-        )
-        answers = rag_model.retriever.generator_tokenizer.batch_decode(outputs, skip_special_tokens=True)
+            input_ids = inputs_dict.input_ids.to(args.device)
+            attention_mask = inputs_dict.attention_mask.to(args.device)
+            outputs = model.generate(  # rag_model overwrites generate
+                input_ids,
+                attention_mask=attention_mask,
+                num_beams=args.num_beams,
+                min_length=args.min_length,
+                max_length=args.max_length,
+                early_stopping=False,
+                num_return_sequences=1,
+                bad_words_ids=[[0, 0]],  # BART likes to repeat BOS tokens, dont allow it to generate more than one
+            )
+            answers = model.retriever.generator_tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        else:
+            if tokenizer is None:
+                raise ValueError("Tokenizer is required for non-RAG models")
+            inputs_dict = tokenizer.batch_encode_plus(
+                questions, return_tensors="pt", padding=True, truncation=True
+            )
+            input_ids = inputs_dict.input_ids.to(args.device)
+            attention_mask = inputs_dict.attention_mask.to(args.device)
+            outputs = model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                num_beams=args.num_beams,
+                min_length=args.min_length,
+                max_length=args.max_length,
+                early_stopping=False,
+                num_return_sequences=1,
+                bad_words_ids=[[0, 0]],
+            )
+            answers = tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
         if args.print_predictions:
             for q, a in zip(questions, answers):
@@ -254,6 +293,12 @@ def get_args():
         help="If True, prints docs retried while generating.",
     )
     parser.add_argument(
+        "--max_eval_samples",
+        default=0,
+        type=int,
+        help="Limit number of evaluation samples (0 means no limit).",
+    )
+    parser.add_argument(
         "--passages_dataset",
         default=None,
         type=str,
@@ -294,7 +339,6 @@ def main(args):
     logger.info("Evaluate the following checkpoints: %s", checkpoints)
 
     score_fn = get_scores if args.eval_mode == "e2e" else get_precision_at_k
-    evaluate_batch_fn = evaluate_batch_e2e if args.eval_mode == "e2e" else evaluate_batch_retrieval
 
     indexed_dataset = None
     if args.model_type.startswith("rag") and args.passages_dataset:
@@ -330,6 +374,7 @@ def main(args):
         logger.info("  Batch size = %d", args.eval_batch_size)
         logger.info("  Predictions will be stored under {}".format(args.predictions_path))
 
+        tokenizer = None
         if args.model_type.startswith("rag"):
             retriever = RagRetriever.from_pretrained(
                 checkpoint,
@@ -340,19 +385,35 @@ def main(args):
             model.retriever.init_retrieval()
         else:
             model = model_class.from_pretrained(checkpoint, **model_kwargs)
+            tokenizer = AutoTokenizer.from_pretrained(checkpoint)
         model.to(args.device)
 
         with open(args.evaluation_set, "r") as eval_file, open(args.predictions_path, "w") as preds_file:
             questions = []
+            seen = 0
+            max_eval = args.max_eval_samples if args.max_eval_samples and args.max_eval_samples > 0 else None
             for line in tqdm(eval_file):
+                if max_eval is not None and seen >= max_eval:
+                    break
                 questions.append(line.strip())
+                seen += 1
                 if len(questions) == args.eval_batch_size:
-                    answers = evaluate_batch_fn(args, model, questions)
+                    if args.eval_mode == "retrieval":
+                        if not args.model_type.startswith("rag"):
+                            raise ValueError("Retrieval eval_mode requires a RAG model.")
+                        answers = evaluate_batch_retrieval(args, model, questions)
+                    else:
+                        answers = evaluate_batch_e2e(args, model, questions, tokenizer=tokenizer)
                     preds_file.write("\n".join(answers) + "\n")
                     preds_file.flush()
                     questions = []
             if len(questions) > 0:
-                answers = evaluate_batch_fn(args, model, questions)
+                if args.eval_mode == "retrieval":
+                    if not args.model_type.startswith("rag"):
+                        raise ValueError("Retrieval eval_mode requires a RAG model.")
+                    answers = evaluate_batch_retrieval(args, model, questions)
+                else:
+                    answers = evaluate_batch_e2e(args, model, questions, tokenizer=tokenizer)
                 preds_file.write("\n".join(answers))
                 preds_file.flush()
 
