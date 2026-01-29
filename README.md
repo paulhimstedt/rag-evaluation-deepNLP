@@ -78,6 +78,7 @@ Start here:
 - `docs/QUICK_REFERENCE.md` (one‑page workflow)
 - `docs/DATASET_PREPARATION_GUIDE.md` (full setup + troubleshooting)
 - `docs/WORKFLOW_DIAGRAM.md` (visual overview)
+- `docs/EXPERIMENTS.md` (all experiments + exact commands)
 
 Other useful references:
 - `docs/DATASET_STATUS.md`
