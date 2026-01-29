@@ -59,7 +59,6 @@ for k in ${N_DOCS_LIST}; do
     --eval-batch-size "${eval_bs}" \
     --max-eval-samples "${NQ_SAMPLES}" \
     --num-beams "${NUM_BEAMS}" \
-    --skip-local-results \
     --results-file "${RESULTS_PREFIX}_nq_k${k}.json"
 done
 
@@ -73,7 +72,6 @@ for k in ${N_DOCS_LIST}; do
     --eval-batch-size "${eval_bs}" \
     --max-eval-samples "${NQ_RETRIEVAL_SAMPLES}" \
     --num-beams "${NUM_BEAMS}" \
-    --skip-local-results \
     --results-file "${RESULTS_PREFIX}_nq_retrieval_k${k}.json"
 done
 
@@ -86,7 +84,6 @@ for k in ${N_DOCS_LIST}; do
     --eval-batch-size "${eval_bs}" \
     --max-eval-samples "${MSMARCO_SAMPLES}" \
     --num-beams "${NUM_BEAMS}" \
-    --skip-local-results \
     --results-file "${RESULTS_PREFIX}_msmarco_k${k}.json"
 done
 
